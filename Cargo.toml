@@ -1,0 +1,14 @@
+[package]
+name = "genesis_builder"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["kernel"]
+
+[dependencies]
+ovmf-prebuilt = "0.1.0-alpha.1"
+
+[build-dependencies]
+bootloader = "0.11.15"
+kernel = { package = "polymorph_os", path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
