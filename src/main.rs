@@ -22,10 +22,11 @@ fn main() {
     // Attach the NVMe Drive to the PCIe Bus!
     cmd.arg("-drive").arg(format!("file={},if=none,id=nvmedrv,format=raw", nvme_path));
     cmd.arg("-device").arg("nvme,drive=nvmedrv,serial=genesis01");
+    cmd.arg("-device").arg("e1000");
     
     cmd.arg("-no-reboot");
     cmd.arg("-no-shutdown");
-    cmd.arg("-serial").arg("tcp:127.0.0.1:4444,server=on,wait=on");
+    cmd.arg("-serial").arg("tcp:127.0.0.1:4444,server=on,wait=off");
 
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     

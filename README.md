@@ -55,54 +55,14 @@ The kernel features a custom async waker and executor, polling tasks from a lock
 
 ### Booting the Kernel
 Clone the repository and run:
-
-Linux/Mac: ./run.sh
-(Make sure to run chmod +x run.sh in the terminal to make it executable)
-
-Windows: run.bat
-
-### Hardware Deployment
-
-### 1. Build the Release Image
-First, compile the kernel with full optimizations. Physical hardware needs the speed.
-
 ```bash
-cargo bootimage --release
+cargo run --release
 ```
-*This generates a raw, bootable disk image located at: `target/x86_64-polymorph_os/release/bootimage-polymorph_os.bin`*
-
-### 2. Identify the USB Drive
-Plug in your USB drive and run `lsblk` to find its device path.
-
-```bash
-lsblk
-```
-Look at the output and identify your USB drive by its size (e.g., `sdb`, `sdc`, `nvme0n1`). **Do not guess.** If you pick your main OS drive, the next command will obliterate your Linux installation.
-
-### 3. Flash to USB (The `dd` Command)
-Assuming your USB drive is `/dev/sdX` (replace `X` with your actual drive letter, like `sdb`. **Do not include the partition number** like `sdb1`, just the drive `sdb`).
-
-Run the `dd` command to bite-copy the kernel directly to the drive's boot sector:
-
-```bash
-sudo dd if=target/x86_64-polymorph_os/release/bootimage-polymorph_os.bin of=/dev/sdX bs=4M status=progress && sync
-```
-
-**Command Breakdown:**
-*   `if=...`: **I**nput **F**ile (Our compiled bare-metal kernel).
-*   `of=/dev/sdX`: **O**utput **F**ile (Your physical USB drive).
-*   `bs=4M`: **B**lock **S**ize. Writes in 4MB chunks for significantly faster flashing.
-*   `status=progress`: Shows a progress bar so you aren't staring at a blank terminal.
-*   `&& sync`: **Crucial.** Forces Linux to flush all write caches to the USB drive before the command finishes, ensuring you don't corrupt the kernel when you unplug it.
-
-Once that finishes, you can pull the USB drive out, plug it into a laptop, hit F12 to enter the boot menu, and watch your 3D Gaussian Splats render on bare metal!
-
 *PolymorphOS will compile natively for `x86_64-unknown-none`, fuse with the OVMF UEFI firmware, and launch QEMU in < 300ms.*
 
 **Available Local Commands:**
 Click into the QEMU window to access the Semantic Terminal. 
-Type `HELP` to view the currently active bare-metal commands (e.g., `SCAN PCI`, `PING NVME`, `LIST`).
-COMANDS NOT AVAILABLE YET: DELETE, MOVE(Coming next with the expanded MFS) 
+Type `HELP` to view the currently active bare-metal commands (e.g., `SCAN PCI`, `PING NVME`, `LIST`). 
 
 ---
 

@@ -1,5 +1,4 @@
 use x86_64::instructions::port::Port;
-use crate::serial_println;
 use alloc::string::String;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Size4KiB};
 
@@ -111,6 +110,33 @@ fn check_device(
                     let driver = crate::e1000::E1000Driver::new(mmio_base as usize); 
                     *crate::e1000::E1000_NET.lock() = Some(driver);
                     crate::serial_println!("     -> [OK] Intel E1000 Driver Initialized and Locked.");
+                }
+            }
+        }
+    }
+
+    // --- TARGET 3: VIRTIO GPU ---
+    // Vendor 0x1AF4 = Red Hat / VirtIO. Device 0x1050 = VirtIO GPU
+    else if vendor_id == 0x1AF4 && device_id == 0x1050 {
+        crate::serial_println!("[*** TARGET LOCKED: VirtIO Graphics Adapter! ***]");
+        
+        let bar0 = pci_read_word(bus, slot, func, 0x10);
+        let is_memory_space = (bar0 & 0x01) == 0;
+        
+        if is_memory_space {
+            let mmio_base = (bar0 & 0xFFFF_FFF0) as u64;
+            crate::serial_println!("     -> VirtIO-GPU Physical Base: {:#010X}", mmio_base);
+            
+            // Map the MMIO space (VirtIO usually requires 4KB or 8KB for registers)
+            unsafe { 
+                if let Err(e) = crate::memory::map_mmio(mmio_base, 0x2000, mapper, frame_allocator) {
+                    crate::serial_println!("     -> [FATAL] Failed to map VirtIO-GPU MMIO: {:?}", e);
+                } else {
+                    crate::serial_println!("     -> [OK] VirtIO-GPU MMIO Mapped.");
+                    
+                    let driver = crate::virtio_gpu::VirtioGpuDriver::new(mmio_base as usize); 
+                    *crate::virtio_gpu::VIRTIO_GPU.lock() = Some(driver);
+                    crate::serial_println!("     ->[OK] VirtIO-GPU Driver Initialized and Locked.");
                 }
             }
         }

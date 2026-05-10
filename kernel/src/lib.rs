@@ -21,7 +21,7 @@ pub mod nvme;
 pub mod splat;
 pub mod mfs;
 pub mod e1000;
-
+pub mod virtio_gpu;
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
