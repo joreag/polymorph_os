@@ -43,11 +43,9 @@ impl SemanticWindow {
 
     //[MICT: THE SLEEK UI]
     pub fn render_body(&self, gpu: &mut GpuDriver) {
-        // Main Body: Deep, dark cyan-tinted glass (Opacity 200)
-        gpu.draw_glass_rect(self.x as usize, self.y as usize, self.w as usize, self.h as usize, 10, 20, 30, 200);
-        
-        // Title Bar: Brighter cyan/white glass
-        gpu.draw_glass_rect(self.x as usize, self.y as usize, self.w as usize, 30, 40, 80, 100, 255);
+        // No more 'as usize' danger! Pass the raw i32 coordinates.
+        gpu.draw_glass_rect(self.x, self.y, self.w, self.h, 10, 20, 30, 200);
+        gpu.draw_glass_rect(self.x, self.y, self.w, 30, 40, 80, 100, 255);
     }
 
 // [MICT: THE COMMAND EXECUTOR]
@@ -77,9 +75,12 @@ pub fn execute_command(&mut self) {
         }
         "SCAN" => {
             if arg1 == "PCI" {
-                let out = "[MICT: MAP] Initiating PCIe Radar...\n  -> Found: 8086:1237 (Intel Host Bridge)\n  -> Found: 1B36:0010 (QEMU NVMe Controller)\n";
-                self.text_buffer.push_str(out);
-                crate::serial_println!("{}", out);
+                // Call the real-time hardware probe!
+                let out = crate::pci::scan_pci_dynamic();
+                self.text_buffer.push_str(&out);
+                
+                // Use serial_print (not println) because the string already contains '\n's
+                crate::serial_print!("{}", out); 
             } else {
                 let usage = "Usage: SCAN PCI\n";
                 self.text_buffer.push_str(usage);
@@ -277,7 +278,7 @@ pub fn execute_command(&mut self) {
                         for (y, row) in bitmap.iter().enumerate() {
                             for x in 0..8 {
                                 if (*row & (1 << x)) != 0 {
-                                    gpu.draw_pixel((cx + x as i32) as usize, (cy + y as i32) as usize, 255, 255, 255);
+                                    gpu.draw_pixel(cx + x as i32, cy + y as i32, 255, 255, 255);
                                 }
                             }
                         }
@@ -331,7 +332,7 @@ impl SplatEngine {
                         let intensity = 255 - falloff as u32;
                         let alpha = (intensity * splat.opacity as u32) / 255;
                         if alpha > 0 {
-                            gpu.blend_pixel(px as usize, py as usize, splat.r, splat.g, splat.b, alpha as u8);
+                            gpu.blend_pixel(px, py, splat.r, splat.g, splat.b, alpha as u8);
                         }
                     }
                 }
@@ -379,7 +380,7 @@ pub fn render_desktop(gpu: &mut GpuDriver, engine: &mut SplatEngine) {
     
     for dy in 0..5 {
         for dx in 0..5 {
-            gpu.draw_pixel((cx + dx) as usize, (cy + dy) as usize, cr, cg, cb);
+            gpu.draw_pixel((cx + dx) as i32, (cy + dy) as i32, cr, cg, cb);
         }
     }
     gpu.swap_buffers();

@@ -1,5 +1,8 @@
 use x86_64::instructions::port::Port;
 use crate::serial_println;
+use alloc::string::String;
+use x86_64::structures::paging::{FrameAllocator, Mapper, Size4KiB};
+
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -21,35 +24,38 @@ pub fn pci_read_word(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
     }
 }
 
-/// [MICT: MAP] - Scans the entire motherboard for hardware
-pub fn enumerate_buses() {
-    serial_println!("[MICT: MAP] Engaging PCIe Hardware Radar...");
+///[MICT: MAP] - Scans the entire motherboard for hardware
+pub fn enumerate_buses(
+    mapper: &mut impl Mapper<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    crate::serial_println!("[MICT: MAP] Engaging PCIe Hardware Radar...");
     
     for bus in 0..=255 {
         for slot in 0..32 {
             let vendor = pci_read_word(bus, slot, 0, 0) & 0xFFFF;
-            if vendor == 0xFFFF {
-                continue; // 0xFFFF means the slot is empty
-            }
+            if vendor == 0xFFFF { continue; }
             
-            // Found a device! Check its functions.
-            check_device(bus, slot, 0);
+            check_device(bus, slot, 0, mapper, frame_allocator);
             
-            // Check if it's a multi-function device (e.g., Audio + Video on one card)
             let header_type = (pci_read_word(bus, slot, 0, 0x0C) >> 16) & 0xFF;
             if (header_type & 0x80) != 0 {
                 for func in 1..8 {
                     if (pci_read_word(bus, slot, func, 0) & 0xFFFF) != 0xFFFF {
-                        check_device(bus, slot, func);
+                        check_device(bus, slot, func, mapper, frame_allocator);
                     }
                 }
             }
         }
     }
-    serial_println!("[MICT: MAP] PCIe Bus Scan Complete.");
+    crate::serial_println!("[MICT: MAP] PCIe Bus Scan Complete.");
 }
 
-fn check_device(bus: u8, slot: u8, func: u8) {
+fn check_device(
+    bus: u8, slot: u8, func: u8,
+    mapper: &mut impl Mapper<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
     let word0 = pci_read_word(bus, slot, func, 0x00);
     let vendor_id = word0 & 0xFFFF;
     let device_id = word0 >> 16;
@@ -58,39 +64,112 @@ fn check_device(bus: u8, slot: u8, func: u8) {
     let class_code = (word2 >> 24) & 0xFF;
     let subclass = (word2 >> 16) & 0xFF;
 
-    // We use serial_println! for the full hardware map so we don't clutter the blue screen
     crate::serial_println!(
         "  -> Hardware Found[Bus {:02X}, Slot {:02X}, Func {}] Vendor: {:04X}, Device: {:04X} | Class: {:02X}, Subclass: {:02X}",
         bus, slot, func, vendor_id, device_id, class_code, subclass
     );
 
-    // Class 0x01 = Mass Storage Controller. Subclass 0x08 = Non-Volatile Memory (NVMe)
+    // --- TARGET 1: NVMe STORAGE ---
     if class_code == 0x01 && subclass == 0x08 {
-        crate::serial_println!("     [*** TARGET LOCKED: NVMe Controller Identified! ***]");
-        //crate::screen_println!("[*** TARGET LOCKED: NVMe Controller Identified! ***]");
+        crate::serial_println!("[*** TARGET LOCKED: NVMe Controller Identified! ***]");
 
-        // [MICT: MAP] - Extract Base Address Registers (BARs)
-        // BAR0 is at offset 0x10. BAR1 is at offset 0x14.
         let bar0 = pci_read_word(bus, slot, func, 0x10);
         let bar1 = pci_read_word(bus, slot, func, 0x14);
 
-        // Check if it's a 64-bit Memory Space BAR (Bit 0 = 0, Bits 1:2 = 10b)
         let is_memory_space = (bar0 & 0x01) == 0;
         let is_64_bit = (bar0 & 0x06) == 0x04;
 
         if is_memory_space {
-            let mmio_base: u64;
-            if is_64_bit {
-                // Mask out the bottom 4 flag bits of BAR0 and combine with BAR1
-                mmio_base = ((bar1 as u64) << 32) | ((bar0 as u64) & 0xFFFF_FFF0);
+            let mmio_base: u64 = if is_64_bit {
+                ((bar1 as u64) << 32) | ((bar0 as u64) & 0xFFFF_FFF0)
             } else {
-                mmio_base = (bar0 as u64) & 0xFFFF_FFF0;
+                (bar0 as u64) & 0xFFFF_FFF0
+            };
+            
+            crate::serial_println!("     -> NVMe Physical Base: {:#018X}", mmio_base);
+            
+        }
+    } 
+    // --- TARGET 2: INTEL E1000 GIGABIT ETHERNET ---
+    else if vendor_id == 0x8086 && device_id == 0x100E {
+        crate::serial_println!("[*** TARGET LOCKED: Intel E1000 Network Card! ***]");
+        let bar0 = pci_read_word(bus, slot, func, 0x10);
+        
+        if (bar0 & 0x01) == 0 {
+            let mmio_base = (bar0 & 0xFFFF_FFF0) as u64;
+            crate::serial_println!("     -> E1000 Physical Base: {:#010X}", mmio_base);
+            
+            // [MICT: MEMORY MAPPING] - Map the E1000 registers!
+            // E1000 requires 128KB (0x20000) of mapped space for all registers.
+            unsafe { 
+                if let Err(e) = crate::memory::map_mmio(mmio_base, 0x20000, mapper, frame_allocator) {
+                    crate::serial_println!("     -> [FATAL] Failed to map E1000 MMIO: {:?}", e);
+                } else {
+                    crate::serial_println!("     -> [OK] E1000 MMIO Mapped.");
+                    
+                    // Now that it's safely in the Page Tables, we can wake the driver!
+                    let driver = crate::e1000::E1000Driver::new(mmio_base as usize); 
+                    *crate::e1000::E1000_NET.lock() = Some(driver);
+                    crate::serial_println!("     -> [OK] Intel E1000 Driver Initialized and Locked.");
+                }
             }
-
-            crate::serial_println!("     -> NVMe MMIO Base Address: {:#018X}", mmio_base);
-            //crate::screen_println!("     -> NVMe MMIO Base Address: {:#018X}", mmio_base);
-        } else {
-            crate::serial_println!("     -> ERROR: NVMe BAR0 is not mapped to Memory Space!");
         }
     }
+}
+
+/// [MICT: DYNAMIC RADAR] - Sweeps the PCIe bus in real-time without initializing drivers.
+pub fn scan_pci_dynamic() -> String {
+    let mut output = String::from("[MICT: MAP] Initiating Dynamic PCIe Radar...\n");
+    
+    for bus in 0..=255 {
+        for slot in 0..32 {
+            let vendor = pci_read_word(bus, slot, 0, 0) & 0xFFFF;
+            if vendor == 0xFFFF {
+                continue; // Slot is empty
+            }
+            
+            // Format the main device
+            output.push_str(&probe_device_to_string(bus, slot, 0));
+            
+            // Check for multi-function devices
+            let header_type = (pci_read_word(bus, slot, 0, 0x0C) >> 16) & 0xFF;
+            if (header_type & 0x80) != 0 {
+                for func in 1..8 {
+                    if (pci_read_word(bus, slot, func, 0) & 0xFFFF) != 0xFFFF {
+                        output.push_str(&probe_device_to_string(bus, slot, func));
+                    }
+                }
+            }
+        }
+    }
+    output.push_str("[MICT: MAP] Dynamic Scan Complete.\n");
+    output
+}
+
+/// Helper function to translate hardware IDs into human-readable strings
+fn probe_device_to_string(bus: u8, slot: u8, func: u8) -> String {
+    let word0 = pci_read_word(bus, slot, func, 0x00);
+    let vendor_id = word0 & 0xFFFF;
+    let device_id = word0 >> 16;
+    
+    let word2 = pci_read_word(bus, slot, func, 0x08);
+    let class_code = (word2 >> 24) & 0xFF;
+    let subclass = (word2 >> 16) & 0xFF;
+
+    // Friendly names for our known hardware
+    let mut name = "Unknown Device";
+    if class_code == 0x01 && subclass == 0x08 {
+        name = "NVMe Controller";
+    } else if vendor_id == 0x8086 && device_id == 0x100E {
+        name = "Intel E1000 Gigabit Network";
+    } else if vendor_id == 0x8086 && device_id == 0x1237 {
+        name = "Intel Host Bridge";
+    } else if class_code == 0x03 && subclass == 0x00 {
+        name = "VGA Compatible Controller";
+    }
+
+    alloc::format!(
+        "  -> Bus {:02X}, Slot {:02X}, Func {} | Ven: {:04X}, Dev: {:04X}[{}]\n",
+        bus, slot, func, vendor_id, device_id, name
+    )
 }

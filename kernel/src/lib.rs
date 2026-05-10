@@ -20,6 +20,7 @@ pub mod gpu_driver;
 pub mod nvme;
 pub mod splat;
 pub mod mfs;
+pub mod e1000;
 
 pub fn init() {
     gdt::init();

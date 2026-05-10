@@ -41,7 +41,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let phys_mem_offset = VirtAddr::new(physical_memory_offset);
     
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };   
 
     allocator::init_heap(&mut mapper, &mut frame_allocator)
         .expect("[DISSONANCE] Fatal Error: MICT Heap initialization failed.");
@@ -90,7 +90,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // ==========================================
     //[4] HARDWARE RADAR & NVMe STORAGE ENGINE
     // ==========================================
-    polymorph_os::pci::enumerate_buses();
+    polymorph_os::pci::enumerate_buses(&mut mapper, &mut frame_allocator);
     polymorph_os::screen_println!("[MICT: MAP] PCIe Hardware Radar complete.");
 
     // Map the NVMe MMIO Space
