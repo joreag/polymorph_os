@@ -82,5 +82,5 @@ This kernel is designed to act as the "Subconscious Engine" to the GenesisOS "Co
 **License:** [Boredbrains Open Knowledge Return License v2 (BOKRLv2)](LICENSE.md)  
 *Built by John Edward Reagan III & the Boredbrains Consortium.*
 
-***
+************
 
