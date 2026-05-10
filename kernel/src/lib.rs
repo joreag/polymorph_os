@@ -22,6 +22,10 @@ pub mod splat;
 pub mod mfs;
 pub mod e1000;
 pub mod virtio_gpu;
+pub mod virtio_pci;
+pub mod virtqueue;
+
+
 pub fn init() {
     gdt::init();
     interrupts::init_idt();

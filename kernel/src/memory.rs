@@ -5,6 +5,7 @@ use x86_64::{
 use bootloader_api::info::{MemoryRegions, MemoryRegionKind};
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::Translate;
 
 /// Initialize a new OffsetPageTable.
 ///
@@ -103,4 +104,46 @@ pub unsafe fn map_mmio(
     }
 
     Ok(VirtAddr::new(physical_address))
+}
+
+///[MICT: TRANSLATION] - The Red Pill
+/// Translates a Rust Virtual Address into a Physical Hardware Address for DMA.
+pub fn virt_to_phys(
+    mapper: &impl Translate, 
+    virt_addr: VirtAddr
+) -> Option<PhysAddr> {
+    // Queries the CPU's active Page Tables to find the physical silicon address
+    mapper.translate_addr(virt_addr)
+}
+
+/// [MICT: DMA ALLOCATION] - The Clean Room
+/// Allocates multiple contiguous 4KB frames of physical memory for large hardware structs.
+pub fn allocate_dma_frames(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+    pages: usize, // <-- NEW: Tell it how many pages we need!
+) -> Option<(PhysAddr, VirtAddr)> {
+    
+    // Grab the first frame to get our starting address
+    if let Some(first_frame) = frame_allocator.allocate_frame() {
+        let phys_addr = first_frame.start_address();
+        let virt_addr = phys_mem_offset + phys_addr.as_u64();
+
+        // Reserve the remaining requested frames so the OS doesn't give them to someone else!
+        for _ in 1..pages {
+            if frame_allocator.allocate_frame().is_none() {
+                // If we run out of memory mid-allocation, we're in trouble.
+                return None; 
+            }
+        }
+
+        // SECURE THE MEMORY: Zero out the ENTIRE block we just reserved!
+        unsafe {
+            core::ptr::write_bytes(virt_addr.as_mut_ptr::<u8>(), 0, pages * 4096);
+        }
+
+        Some((phys_addr, virt_addr))
+    } else {
+        None 
+    }
 }

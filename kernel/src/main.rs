@@ -90,37 +90,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // ==========================================
     //[4] HARDWARE RADAR & NVMe STORAGE ENGINE
     // ==========================================
-    polymorph_os::pci::enumerate_buses(&mut mapper, &mut frame_allocator);
+    polymorph_os::pci::enumerate_buses(&mut mapper, &mut frame_allocator, phys_mem_offset);
     polymorph_os::screen_println!("[MICT: MAP] PCIe Hardware Radar complete.");
 
-    // Map the NVMe MMIO Space
-    let nvme_physical_bar0 = 0x0000000800000000;
-    let nvme_mmio_size = 0x4000; // 16 KB
-
-    let nvme_virtual_addr = unsafe {
-        polymorph_os::memory::map_mmio(
-            nvme_physical_bar0, 
-            nvme_mmio_size, 
-            &mut mapper, 
-            &mut frame_allocator
-        ).expect("[DISSONANCE] Failed to map NVMe MMIO space!")
-    };
-    
-    polymorph_os::screen_println!("[MICT: TRANSFORM] NVMe MMIO mapped (NO_CACHE) at: {:#X}", nvme_virtual_addr.as_u64());
-
-    // Power Cycle & Configure NVMe Controller
-        let mut nvme_drive = unsafe { 
-        polymorph_os::nvme::NvmeController::new(nvme_virtual_addr.as_u64() as usize) 
-    };
-    
-    nvme_drive.ping();
-    nvme_drive.disable();
-    nvme_drive.configure_and_enable(&mapper);
-    nvme_drive.identify_controller(&mapper);
-    nvme_drive.setup_io_queues(&mapper);
-
-    //[MICT: LOCK THE HARD DRIVE INTO GLOBAL STATE]
-    *polymorph_os::nvme::NVME_DRIVE.lock() = Some(nvme_drive);
 
     #[cfg(test)]
     test_main();

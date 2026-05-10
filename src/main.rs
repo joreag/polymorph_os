@@ -23,6 +23,7 @@ fn main() {
     cmd.arg("-drive").arg(format!("file={},if=none,id=nvmedrv,format=raw", nvme_path));
     cmd.arg("-device").arg("nvme,drive=nvmedrv,serial=genesis01");
     cmd.arg("-device").arg("e1000");
+    cmd.arg("-device").arg("virtio-gpu");
     
     cmd.arg("-no-reboot");
     cmd.arg("-no-shutdown");

@@ -1,7 +1,7 @@
 use x86_64::instructions::port::Port;
 use alloc::string::String;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Size4KiB};
-
+use x86_64::structures::paging::{FrameAllocator, Mapper, Size4KiB, Translate};
+use x86_64::VirtAddr;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -25,8 +25,9 @@ pub fn pci_read_word(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
 
 ///[MICT: MAP] - Scans the entire motherboard for hardware
 pub fn enumerate_buses(
-    mapper: &mut impl Mapper<Size4KiB>,
+    mapper: &mut (impl Mapper<Size4KiB> + Translate),
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
 ) {
     crate::serial_println!("[MICT: MAP] Engaging PCIe Hardware Radar...");
     
@@ -35,13 +36,13 @@ pub fn enumerate_buses(
             let vendor = pci_read_word(bus, slot, 0, 0) & 0xFFFF;
             if vendor == 0xFFFF { continue; }
             
-            check_device(bus, slot, 0, mapper, frame_allocator);
+            check_device(bus, slot, 0, mapper, frame_allocator, phys_mem_offset); 
             
             let header_type = (pci_read_word(bus, slot, 0, 0x0C) >> 16) & 0xFF;
             if (header_type & 0x80) != 0 {
                 for func in 1..8 {
                     if (pci_read_word(bus, slot, func, 0) & 0xFFFF) != 0xFFFF {
-                        check_device(bus, slot, func, mapper, frame_allocator);
+                        check_device(bus, slot, func, mapper, frame_allocator, phys_mem_offset);
                     }
                 }
             }
@@ -52,8 +53,9 @@ pub fn enumerate_buses(
 
 fn check_device(
     bus: u8, slot: u8, func: u8,
-    mapper: &mut impl Mapper<Size4KiB>,
+    mapper: &mut (impl Mapper<Size4KiB> + Translate),
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
 ) {
     let word0 = pci_read_word(bus, slot, func, 0x00);
     let vendor_id = word0 & 0xFFFF;
@@ -87,6 +89,22 @@ fn check_device(
             
             crate::serial_println!("     -> NVMe Physical Base: {:#018X}", mmio_base);
             
+            // [MICT: DYNAMIC NVMe INITIALIZATION]
+            unsafe {
+                let nvme_virtual_addr = crate::memory::map_mmio(
+                    mmio_base, 0x4000, mapper, frame_allocator
+                ).expect("[FATAL] Failed to map NVMe MMIO space!");
+                
+                let mut nvme_drive = crate::nvme::NvmeController::new(nvme_virtual_addr.as_u64() as usize); 
+                nvme_drive.ping();
+                nvme_drive.disable();
+                nvme_drive.configure_and_enable(mapper);
+                nvme_drive.identify_controller(mapper);
+                nvme_drive.setup_io_queues(mapper);
+
+                *crate::nvme::NVME_DRIVE.lock() = Some(nvme_drive);
+                crate::serial_println!("     -> [OK] NVMe Controller Initialized dynamically.");
+            }
         }
     } 
     // --- TARGET 2: INTEL E1000 GIGABIT ETHERNET ---
@@ -116,29 +134,15 @@ fn check_device(
     }
 
     // --- TARGET 3: VIRTIO GPU ---
-    // Vendor 0x1AF4 = Red Hat / VirtIO. Device 0x1050 = VirtIO GPU
     else if vendor_id == 0x1AF4 && device_id == 0x1050 {
         crate::serial_println!("[*** TARGET LOCKED: VirtIO Graphics Adapter! ***]");
         
-        let bar0 = pci_read_word(bus, slot, func, 0x10);
-        let is_memory_space = (bar0 & 0x01) == 0;
-        
-        if is_memory_space {
-            let mmio_base = (bar0 & 0xFFFF_FFF0) as u64;
-            crate::serial_println!("     -> VirtIO-GPU Physical Base: {:#010X}", mmio_base);
-            
-            // Map the MMIO space (VirtIO usually requires 4KB or 8KB for registers)
-            unsafe { 
-                if let Err(e) = crate::memory::map_mmio(mmio_base, 0x2000, mapper, frame_allocator) {
-                    crate::serial_println!("     -> [FATAL] Failed to map VirtIO-GPU MMIO: {:?}", e);
-                } else {
-                    crate::serial_println!("     -> [OK] VirtIO-GPU MMIO Mapped.");
-                    
-                    let driver = crate::virtio_gpu::VirtioGpuDriver::new(mmio_base as usize); 
-                    *crate::virtio_gpu::VIRTIO_GPU.lock() = Some(driver);
-                    crate::serial_println!("     ->[OK] VirtIO-GPU Driver Initialized and Locked.");
-                }
-            }
+        //[MICT: INITIATE THE HANDSHAKE]
+        // Notice we are now passing `phys_mem_offset` at the very end!
+        if let Err(e) = crate::virtio_pci::init_virtio_device(bus, slot, func, mapper, frame_allocator, phys_mem_offset) {
+            crate::serial_println!("     -> [FATAL] VirtIO Handshake Failed: {}", e);
+        } else {
+            crate::serial_println!("     -> [OK] VirtIO Handshake process started.");
         }
     }
 }
