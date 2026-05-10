@@ -57,6 +57,7 @@ The kernel features a custom async waker and executor, polling tasks from a lock
 Clone the repository and run:
 
 Linux/Mac: ./run.sh
+
 Windows: run.bat
 
 ### Hardware Deployment
