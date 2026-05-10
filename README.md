@@ -99,7 +99,8 @@ Once that finishes, you can pull the USB drive out, plug it into a laptop, hit F
 
 **Available Local Commands:**
 Click into the QEMU window to access the Semantic Terminal. 
-Type `HELP` to view the currently active bare-metal commands (e.g., `SCAN PCI`, `PING NVME`, `LIST`). 
+Type `HELP` to view the currently active bare-metal commands (e.g., `SCAN PCI`, `PING NVME`, `LIST`).
+COMANDS NOT AVAILABLE YET: DELETE, MOVE(Coming next with the expanded MFS) 
 
 ---
 
