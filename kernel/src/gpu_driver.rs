@@ -133,13 +133,34 @@ impl GpuDriver {
         self.back_buffer[offset + 2] = (((r as u32 * a) + (bg_r * inv_a)) >> 8) as u8;
     }
 
+    // [MICT: THE FLIP] 
     pub fn swap_buffers(&mut self) {
-        unsafe {
-            ptr::copy_nonoverlapping(
-                self.back_buffer.as_ptr(),
-                self.framebuffer_ptr,
-                self.back_buffer.len(),
-            );
+        let virtio_backing = crate::virtio_gpu::VIRTIO_BACKING_VIRT.load(core::sync::atomic::Ordering::SeqCst);
+        
+        if virtio_backing != 0 {
+            // --- VIRTIO HARDWARE ACCELERATION MODE ---
+            // 1. Copy our software pixels into the physical DMA RAM
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.back_buffer.as_ptr(),
+                    virtio_backing as *mut u8,
+                    self.back_buffer.len(),
+                );
+            }
+            
+            // 2. Ring the VirtIO Doorbell to push the RAM to the physical monitor!
+            if let Some(virtio) = crate::virtio_gpu::VIRTIO_GPU.lock().as_mut() {
+                unsafe { virtio.flush_to_screen(1, self.width as u32, self.height as u32); }
+            }
+        //} else {
+            // --- LEGACY UEFI GOP FALLBACK ---
+           // unsafe {
+                //ptr::copy_nonoverlapping(
+                    //self.back_buffer.as_ptr(),
+                    //self.framebuffer_ptr,
+                   // self.back_buffer.len(),
+                //);
+            //}
         }
     }
 }

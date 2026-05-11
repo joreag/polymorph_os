@@ -383,6 +383,7 @@ pub fn render_desktop(gpu: &mut GpuDriver, engine: &mut SplatEngine) {
             gpu.draw_pixel((cx + dx) as i32, (cy + dy) as i32, cr, cg, cb);
         }
     }
+    
     gpu.swap_buffers();
 }
 

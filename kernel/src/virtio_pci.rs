@@ -156,17 +156,52 @@ pub fn init_virtio_device(
         crate::serial_println!("[VIRTIO] Handshake Complete. DRIVER_OK set. Device is LIVE.");
 
         // [MICT: SEND THE FIRST COMMAND]
-        // We use gpu_driver locally BEFORE we give it away to the Mutex!
         if let Err(e) = gpu_driver.get_display_info() {
             crate::serial_println!("[VIRTIO FATAL] Failed to send command: {}", e);
         }
 
-        // --- THE FIX: Lock into global state LAST ---
-        // Now that the handshake and test are complete, we move ownership 
-        // of the driver into the global Mutex for the rest of the OS to use.
+        // --- THE MICT COMPOSITOR INITIALIZATION ---
+        
+        // 1. Get the TRUE screen resolution from the active GpuDriver!
+        let mut screen_w = 800;
+        let mut screen_h = 600;
+        if let Some(gpu) = crate::gpu_driver::GPU_WRITER.lock().as_ref() {
+            screen_w = gpu.width as u32;
+            screen_h = gpu.height as u32;
+        }
+
+        // 2. Create the Canvas using the exact dimensions
+        if let Err(e) = gpu_driver.create_2d_canvas(1, screen_w, screen_h) {
+            crate::serial_println!("[VIRTIO FATAL] {}", e);
+        }
+
+        // 3. Calculate exactly how many 4KB pages we need for the screen RAM
+        let bytes_needed = (screen_w * screen_h * 4) as u64;
+        let pages_needed = ((bytes_needed + 4095) / 4096) as usize;
+
+        if let Some((phys_back_buffer, virt_back_buffer)) = crate::memory::allocate_dma_frames(frame_allocator, phys_mem_offset, pages_needed) {
+            
+            // Save the Virtual Address globally so gpu_driver.rs can find it!
+            crate::virtio_gpu::VIRTIO_BACKING_VIRT.store(virt_back_buffer.as_u64(), core::sync::atomic::Ordering::SeqCst);
+
+            // Attach it to the GPU
+            if let Err(e) = gpu_driver.attach_backing(1, phys_back_buffer.as_u64(), bytes_needed as u32) {
+                 crate::serial_println!("[VIRTIO FATAL] {}", e);
+            }
+            
+            // Seize the Monitor!
+            if let Err(e) = gpu_driver.set_scanout(0, 1, screen_w, screen_h) {
+                 crate::serial_println!("[VIRTIO FATAL] {}", e);
+            }
+            
+            crate::serial_println!("[VIRTIO-GPU] MICT Compositor Pipeline Primed and Ready.");
+        } else {
+            crate::serial_println!("[VIRTIO FATAL] Failed to allocate RAM for the back buffer.");
+        }
+
+        // Lock the driver into the global state
         *crate::virtio_gpu::VIRTIO_GPU.lock() = Some(gpu_driver);
     }
-
     Ok(())
 }
 

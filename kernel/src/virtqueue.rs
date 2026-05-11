@@ -24,7 +24,7 @@ pub struct VirtqDesc {
 pub struct VirtqAvail {
     pub flags: u16,
     pub idx: AtomicU16,      // Where the CPU will write next
-    pub ring:[u16; 256],    // The array of descriptor indices (Assume a queue size of 256 for now)
+    pub ring:[u16; 64],    // The array of descriptor indices (Assume a queue size of 256 for now)
     pub used_event: u16,     // Only used if VIRTIO_F_EVENT_IDX is negotiated
 }
 
@@ -42,7 +42,7 @@ pub struct VirtqUsedElem {
 pub struct VirtqUsed {
     pub flags: u16,
     pub idx: AtomicU16,            // Where the GPU wrote last
-    pub ring: [VirtqUsedElem; 256], // The array of finished commands
+    pub ring: [VirtqUsedElem; 64], // The array of finished commands
     pub avail_event: u16,
 }
 
@@ -50,7 +50,7 @@ pub struct VirtqUsed {
 // We tie it all together. This entire struct will be allocated in physical RAM.
 #[repr(C, align(4096))] // Must be page-aligned!
 pub struct VirtQueue {
-    pub descriptors: [VirtqDesc; 256],
+    pub descriptors: [VirtqDesc; 64],
     pub available: VirtqAvail,
     // (In reality, there's padding here to reach the next page boundary, 
     // but we will calculate that dynamically during Phase 2 setup)
@@ -66,16 +66,16 @@ impl VirtQueue {
     /// Setup the internal tracking for an empty queue
     pub fn new() -> Self {
         let mut vq = VirtQueue {
-            descriptors:[VirtqDesc { addr: 0, len: 0, flags: 0, next: 0 }; 256],
-            available: VirtqAvail { flags: 0, idx: AtomicU16::new(0), ring: [0; 256], used_event: 0 },
-            used: VirtqUsed { flags: 0, idx: AtomicU16::new(0), ring:[VirtqUsedElem { id: 0, len: 0 }; 256], avail_event: 0 },
+            descriptors:[VirtqDesc { addr: 0, len: 0, flags: 0, next: 0 }; 64],
+            available: VirtqAvail { flags: 0, idx: AtomicU16::new(0), ring: [0; 64], used_event: 0 },
+            used: VirtqUsed { flags: 0, idx: AtomicU16::new(0), ring:[VirtqUsedElem { id: 0, len: 0 }; 64], avail_event: 0 },
             free_head: 0,
-            num_free: 256,
+            num_free: 64,
             last_used_idx: 0,
         };
 
-        // Chain all the free descriptors together
-        for i in 0..255 {
+        // Chain the free descriptors together (0 to 62 points to next)
+        for i in 0..63 {
             vq.descriptors[i as usize].next = i + 1;
         }
         vq

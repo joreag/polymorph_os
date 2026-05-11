@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::{VirtAddr, PhysAddr};
 use x86_64::structures::paging::{FrameAllocator, Size4KiB};
+pub static VIRTIO_BACKING_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 
 pub static VIRTIO_GPU: Mutex<Option<VirtioGpuDriver>> = Mutex::new(None);
@@ -238,7 +239,7 @@ impl VirtioGpuDriver {
 
         // 3. Put our descriptor index into the Available Ring
         let avail_idx = vq.available.idx.load(core::sync::atomic::Ordering::SeqCst) as usize;
-        vq.available.ring[avail_idx % 256] = head_idx as u16;
+        vq.available.ring[avail_idx % 64] = head_idx as u16;
 
         // [FIX]: Upgrade to a full hardware memory barrier!
         // This forces the CPU to flush the cache to RAM so the GPU can see it.
@@ -299,7 +300,7 @@ impl VirtioGpuDriver {
 
         // 4. PUT IT IN THE OUTBOX (Available Ring)
         let avail_idx = vq.available.idx.load(core::sync::atomic::Ordering::SeqCst) as usize;
-        vq.available.ring[avail_idx % 256] = head_idx as u16;
+        vq.available.ring[avail_idx % 64] = head_idx as u16;
 
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         vq.available.idx.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -332,12 +333,323 @@ impl VirtioGpuDriver {
         } else {
             crate::serial_println!("[VIRTIO] 🛑 GPU returned error code: {:?}", response.header.ty);
         }
+        // [MICT: RECLAIM DESCRIPTORS]
+        vq.descriptors[next_idx].next = vq.free_head;
+        vq.free_head = head_idx as u16;
+        vq.num_free += 2;
 
         Ok(())
+        
     }
     
     // Helper to generate unique IDs for our canvases
     pub fn next_resource_id(&self) -> u32 {
         self.resource_id_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// [MICT: SEIZE THE CANVAS]
+    /// Commands the GPU to create a 2D resource (a canvas) in its VRAM.
+    pub unsafe fn create_2d_canvas(&mut self, resource_id: u32, width: u32, height: u32) -> Result<(), &'static str> {
+        let mailbox_virt = self.mailbox_virt.expect("Mailbox missing!");
+        let mailbox_phys = self.mailbox_phys.expect("Mailbox missing!");
+        let vq_virt = self.control_queue_virt.expect("Control Queue missing!");
+        let vq = &mut *(vq_virt as *mut crate::virtqueue::VirtQueue);
+
+        crate::serial_println!("[VIRTIO-GPU] Forging 2D Canvas ({}x{}) with Resource ID: {}", width, height, resource_id);
+
+        // 1. DRAFT THE COMMAND
+        let cmd_ptr = mailbox_virt as *mut ResourceCreate2d;
+        *cmd_ptr = ResourceCreate2d {
+            header: ControlHeader::with_ty(CommandTy::ResourceCreate2d),
+            resource_id,
+            format: ResourceFormat::Bgrx, // Standard 32-bit color format
+            width,
+            height,
+        };
+
+        // 2. PREPARE THE REPLY ENVELOPE (Offset by 512 bytes)
+        let resp_phys = mailbox_phys + 512;
+        let resp_virt = mailbox_virt + 512;
+        core::ptr::write_bytes(resp_virt as *mut u8, 0, core::mem::size_of::<ControlHeader>());
+
+        // 3. LOAD DESCRIPTORS & SEND
+        let head_idx = vq.free_head as usize;
+        let next_idx = vq.descriptors[head_idx].next as usize;
+        vq.free_head = vq.descriptors[next_idx].next;
+        vq.num_free -= 2;
+
+        // Desc 1: Command
+        vq.descriptors[head_idx].addr = mailbox_phys;
+        vq.descriptors[head_idx].len = core::mem::size_of::<ResourceCreate2d>() as u32;
+        vq.descriptors[head_idx].flags = crate::virtqueue::VIRTQ_DESC_F_NEXT;
+        vq.descriptors[head_idx].next = next_idx as u16;
+
+        // Desc 2: Reply
+        vq.descriptors[next_idx].addr = resp_phys;
+        vq.descriptors[next_idx].len = core::mem::size_of::<ControlHeader>() as u32;
+        vq.descriptors[next_idx].flags = crate::virtqueue::VIRTQ_DESC_F_WRITE;
+
+        let avail_idx = vq.available.idx.load(core::sync::atomic::Ordering::SeqCst) as usize;
+        vq.available.ring[avail_idx % 64] = head_idx as u16;
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        vq.available.idx.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+        // RING DOORBELL
+        if let Some(notify_addr) = self.notify_address {
+            core::ptr::write_volatile(notify_addr as *mut u16, 0);
+        }
+
+        // WAIT FOR REPLY
+        let starting_used_idx = vq.last_used_idx;
+        loop {
+            if starting_used_idx != vq.used.idx.load(core::sync::atomic::Ordering::Acquire) { break; }
+        }
+        vq.last_used_idx = vq.used.idx.load(core::sync::atomic::Ordering::Acquire);
+
+        let response = &*(resp_virt as *const ControlHeader);
+        if response.ty == CommandTy::RespOkNodata {
+            crate::serial_println!("  -> [OK] Canvas Created!");
+            // [MICT: RECLAIM DESCRIPTORS]
+        vq.descriptors[next_idx].next = vq.free_head;
+        vq.free_head = head_idx as u16;
+        vq.num_free += 2;
+            Ok(())
+        } else {
+            Err("GPU failed to create 2D canvas.")
+        }
+        
+    }
+
+    ///[MICT: THE DMA UMBILICAL CORD]
+    /// Tells the GPU the exact physical RAM address of our Splat Engine's back_buffer.
+    pub unsafe fn attach_backing(&mut self, resource_id: u32, back_buffer_phys: u64, buffer_length: u32) -> Result<(), &'static str> {
+        let mailbox_virt = self.mailbox_virt.expect("Mailbox missing!");
+        let mailbox_phys = self.mailbox_phys.expect("Mailbox missing!");
+        let vq_virt = self.control_queue_virt.expect("Control Queue missing!");
+        let vq = &mut *(vq_virt as *mut crate::virtqueue::VirtQueue);
+
+        crate::serial_println!("[VIRTIO-GPU] Attaching MICT Splat RAM to GPU Canvas...");
+
+        // 1. DRAFT THE COMMAND (AttachBacking struct followed immediately by MemEntry structs)
+        // We write the command header to the start of the mailbox
+        let cmd_ptr = mailbox_virt as *mut AttachBacking;
+        *cmd_ptr = AttachBacking {
+            header: ControlHeader::with_ty(CommandTy::ResourceAttachBacking),
+            resource_id,
+            num_entries: 1, // We are providing 1 contiguous chunk of physical RAM
+        };
+
+        // We write the Memory Entry immediately after the command struct in the mailbox!
+        let entry_ptr = (mailbox_virt + core::mem::size_of::<AttachBacking>() as u64) as *mut MemEntry;
+        *entry_ptr = MemEntry {
+            address: back_buffer_phys,
+            length: buffer_length,
+            padding: 0,
+        };
+
+        let total_cmd_size = core::mem::size_of::<AttachBacking>() + core::mem::size_of::<MemEntry>();
+
+        // 2. PREPARE REPLY ENVELOPE (Offset by 512 bytes to be safe)
+        let resp_phys = mailbox_phys + 512;
+        let resp_virt = mailbox_virt + 512;
+        core::ptr::write_bytes(resp_virt as *mut u8, 0, core::mem::size_of::<ControlHeader>());
+
+        // 3. LOAD DESCRIPTORS & SEND
+        let head_idx = vq.free_head as usize;
+        let next_idx = vq.descriptors[head_idx].next as usize;
+        vq.free_head = vq.descriptors[next_idx].next;
+        vq.num_free -= 2;
+
+        vq.descriptors[head_idx].addr = mailbox_phys;
+        vq.descriptors[head_idx].len = total_cmd_size as u32;
+        vq.descriptors[head_idx].flags = crate::virtqueue::VIRTQ_DESC_F_NEXT;
+        vq.descriptors[head_idx].next = next_idx as u16;
+
+        vq.descriptors[next_idx].addr = resp_phys;
+        vq.descriptors[next_idx].len = core::mem::size_of::<ControlHeader>() as u32;
+        vq.descriptors[next_idx].flags = crate::virtqueue::VIRTQ_DESC_F_WRITE;
+
+        let avail_idx = vq.available.idx.load(core::sync::atomic::Ordering::SeqCst) as usize;
+        vq.available.ring[avail_idx % 64] = head_idx as u16;
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        vq.available.idx.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+        // RING DOORBELL
+        if let Some(notify_addr) = self.notify_address {
+            core::ptr::write_volatile(notify_addr as *mut u16, 0);
+        }
+
+        // WAIT FOR REPLY
+        let starting_used_idx = vq.last_used_idx;
+        loop {
+            if starting_used_idx != vq.used.idx.load(core::sync::atomic::Ordering::Acquire) { break; }
+        }
+        vq.last_used_idx = vq.used.idx.load(core::sync::atomic::Ordering::Acquire);
+
+        let response = &*(resp_virt as *const ControlHeader);
+        if response.ty == CommandTy::RespOkNodata {
+            crate::serial_println!("  -> [OK] DMA Backing Attached!");
+            // [MICT: RECLAIM DESCRIPTORS]
+        vq.descriptors[next_idx].next = vq.free_head;
+        vq.free_head = head_idx as u16;
+        vq.num_free += 2;
+            Ok(())
+        } else {
+            Err("GPU failed to attach backing memory.")
+        }
+    }
+
+    ///[MICT: SEIZE THE MONITOR]
+    /// Binds our 2D Canvas to a physical display output (Scanout 0).
+    pub unsafe fn set_scanout(&mut self, scanout_id: u32, resource_id: u32, width: u32, height: u32) -> Result<(), &'static str> {
+        let mailbox_virt = self.mailbox_virt.expect("Mailbox missing!");
+        let mailbox_phys = self.mailbox_phys.expect("Mailbox missing!");
+        let vq_virt = self.control_queue_virt.expect("Queue missing!");
+        let vq = &mut *(vq_virt as *mut crate::virtqueue::VirtQueue);
+
+        crate::serial_println!("[VIRTIO-GPU] Binding Canvas to Monitor {}...", scanout_id);
+
+        let cmd_ptr = mailbox_virt as *mut SetScanout;
+        *cmd_ptr = SetScanout {
+            header: ControlHeader::with_ty(CommandTy::SetScanout),
+            rect: GpuRect { x: 0, y: 0, width, height },
+            scanout_id,
+            resource_id,
+        };
+
+        let resp_phys = mailbox_phys + 512;
+        let resp_virt = mailbox_virt + 512;
+        core::ptr::write_bytes(resp_virt as *mut u8, 0, core::mem::size_of::<ControlHeader>());
+
+        let head_idx = vq.free_head as usize;
+        let next_idx = vq.descriptors[head_idx].next as usize;
+        vq.free_head = vq.descriptors[next_idx].next;
+        vq.num_free -= 2;
+
+        vq.descriptors[head_idx].addr = mailbox_phys;
+        vq.descriptors[head_idx].len = core::mem::size_of::<SetScanout>() as u32;
+        vq.descriptors[head_idx].flags = crate::virtqueue::VIRTQ_DESC_F_NEXT;
+        vq.descriptors[head_idx].next = next_idx as u16;
+
+        vq.descriptors[next_idx].addr = resp_phys;
+        vq.descriptors[next_idx].len = core::mem::size_of::<ControlHeader>() as u32;
+        vq.descriptors[next_idx].flags = crate::virtqueue::VIRTQ_DESC_F_WRITE;
+
+        let avail_idx = vq.available.idx.load(core::sync::atomic::Ordering::SeqCst) as usize;
+        vq.available.ring[avail_idx % 64] = head_idx as u16;
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        vq.available.idx.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+        if let Some(notify_addr) = self.notify_address { core::ptr::write_volatile(notify_addr as *mut u16, 0); }
+
+        let starting_used_idx = vq.last_used_idx;
+        loop { if starting_used_idx != vq.used.idx.load(core::sync::atomic::Ordering::Acquire) { break; } }
+        vq.last_used_idx = vq.used.idx.load(core::sync::atomic::Ordering::Acquire);
+
+        let response = &*(resp_virt as *const ControlHeader);
+        if response.ty == CommandTy::RespOkNodata {
+            crate::serial_println!("  -> [OK] Scanout Locked!");
+            // [MICT: RECLAIM DESCRIPTORS]
+        vq.descriptors[next_idx].next = vq.free_head;
+        vq.free_head = head_idx as u16;
+        vq.num_free += 2;
+            Ok(())
+        } else {
+            Err("GPU failed to set scanout.")
+        }
+    }
+
+    ///[MICT: NON-BLOCKING HARDWARE RENDER]
+    /// Drops the Transfer and Flush commands into the mailbox and walks away.
+    pub unsafe fn flush_to_screen(&mut self, resource_id: u32, width: u32, height: u32) {
+        let mailbox_virt = self.mailbox_virt.unwrap();
+        let mailbox_phys = self.mailbox_phys.unwrap();
+        let vq = &mut *(self.control_queue_virt.unwrap() as *mut crate::virtqueue::VirtQueue);
+
+        // We need 4 descriptors for this combined command
+        if vq.num_free < 4 { return; } // Drop the frame if the queue is full, don't crash!
+
+        // --- COMMAND 1: TRANSFER TO HOST ---
+        let cmd1_ptr = mailbox_virt as *mut TransferToHost2d;
+        *cmd1_ptr = TransferToHost2d {
+            header: ControlHeader::with_ty(CommandTy::TransferToHost2d),
+            rect: GpuRect { x: 0, y: 0, width, height },
+            offset: 0,
+            resource_id,
+            padding: 0,
+        };
+
+        // --- COMMAND 2: RESOURCE FLUSH ---
+        // Place it right after the first command in our mailbox
+        let cmd2_offset = core::mem::size_of::<TransferToHost2d>() as u64;
+        let cmd2_ptr = (mailbox_virt + cmd2_offset) as *mut ResourceFlush;
+        *cmd2_ptr = ResourceFlush {
+            header: ControlHeader::with_ty(CommandTy::ResourceFlush),
+            rect: GpuRect { x: 0, y: 0, width, height },
+            resource_id,
+            padding: 0,
+        };
+
+        // Empty response envelopes
+        let resp1_phys = mailbox_phys + 512;
+        let resp2_phys = mailbox_phys + 528; // Shifted over for the second response
+        
+        // Grab 4 linked descriptors
+        let head_idx = vq.free_head as usize;
+        let idx2 = vq.descriptors[head_idx].next as usize;
+        let idx3 = vq.descriptors[idx2].next as usize;
+        let tail_idx = vq.descriptors[idx3].next as usize;
+        
+        vq.free_head = vq.descriptors[tail_idx].next;
+        vq.num_free -= 4;
+
+        // Desc 1: Transfer Command
+        vq.descriptors[head_idx].addr = mailbox_phys;
+        vq.descriptors[head_idx].len = core::mem::size_of::<TransferToHost2d>() as u32;
+        vq.descriptors[head_idx].flags = crate::virtqueue::VIRTQ_DESC_F_NEXT;
+        
+        // Desc 2: Transfer Response
+        vq.descriptors[idx2].addr = resp1_phys;
+        vq.descriptors[idx2].len = core::mem::size_of::<ControlHeader>() as u32;
+        // NOTE: We don't use NEXT here, this concludes the first command packet
+        vq.descriptors[idx2].flags = crate::virtqueue::VIRTQ_DESC_F_WRITE;
+
+        // Desc 3: Flush Command
+        vq.descriptors[idx3].addr = mailbox_phys + cmd2_offset;
+        vq.descriptors[idx3].len = core::mem::size_of::<ResourceFlush>() as u32;
+        vq.descriptors[idx3].flags = crate::virtqueue::VIRTQ_DESC_F_NEXT;
+
+        // Desc 4: Flush Response
+        vq.descriptors[tail_idx].addr = resp2_phys;
+        vq.descriptors[tail_idx].len = core::mem::size_of::<ControlHeader>() as u32;
+        vq.descriptors[tail_idx].flags = crate::virtqueue::VIRTQ_DESC_F_WRITE;
+
+        // Put BOTH command heads in the available ring
+        let avail_idx = vq.available.idx.load(core::sync::atomic::Ordering::SeqCst) as usize;
+        vq.available.ring[avail_idx % 64] = head_idx as u16;
+        vq.available.ring[(avail_idx + 1) % 64] = idx3 as u16;
+        
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        
+        // We added 2 commands, so increment index by 2
+        vq.available.idx.fetch_add(2, core::sync::atomic::Ordering::SeqCst);
+
+        // RING THE DOORBELL
+        if let Some(n) = self.notify_address { core::ptr::write_volatile(n as *mut u16, 0); }
+
+        // --- THE CRITICAL FIX: DO NOT WAIT ---
+        // We immediately reclaim the descriptors, assuming the GPU will process them instantly.
+        // In a true Phase 4 driver, we would reclaim these inside a hardware interrupt handler,
+        // but for now, this blind reclaim un-bricks the OS.
+        vq.descriptors[idx2].next = vq.free_head;
+        vq.free_head = head_idx as u16;
+        
+        vq.descriptors[tail_idx].next = vq.free_head;
+        vq.free_head = idx3 as u16;
+        
+        vq.num_free += 4;
     }
 }

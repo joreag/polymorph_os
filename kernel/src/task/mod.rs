@@ -39,3 +39,28 @@ impl TaskId {
         TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
+
+/// A Future that yields control to the executor exactly once, allowing other tasks to run.
+pub struct YieldNow {
+    yielded: bool,
+}
+
+pub fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            // Wake ourselves up so the executor knows to come back to us eventually
+            cx.waker().wake_by_ref(); 
+            // Return Pending to force the executor to switch to the keyboard/network tasks!
+            Poll::Pending 
+        }
+    }
+}
