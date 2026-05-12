@@ -24,10 +24,17 @@ fn main() {
     cmd.arg("-device").arg("nvme,drive=nvmedrv,serial=genesis01");
     cmd.arg("-device").arg("e1000");
     cmd.arg("-vga").arg("virtio");
+    cmd.arg("-global").arg("virtio-vga.xres=1920");
+    cmd.arg("-global").arg("virtio-vga.yres=1080");
+
+    // --- [MICT: THE KVM AFTERBURNER] ---
+    cmd.arg("-enable-kvm");      // Bypass software emulation, use physical silicon!
+    cmd.arg("-cpu").arg("host"); // Give the VM the exact Ultra 7 architecture!
+    cmd.arg("-smp").arg("4");    // Give the OS 4 physical cores to play with!
     
     cmd.arg("-no-reboot");
     cmd.arg("-no-shutdown");
-    cmd.arg("-serial").arg("tcp:127.0.0.1:4444,server=on,wait=off");
+    cmd.arg("-serial").arg("tcp:127.0.0.1:4444,server=on,wait=on");
 
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     

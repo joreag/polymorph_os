@@ -279,10 +279,16 @@ async fn desktop_compositor_task() {
                 let mut cx = polymorph_os::splat::CURSOR_X.load(Ordering::SeqCst);
                 let mut cy = polymorph_os::splat::CURSOR_Y.load(Ordering::SeqCst);
 
+                // --- NEW: DYNAMIC BOUNDARIES ---
+                let max_x = polymorph_os::splat::SCREEN_WIDTH.load(Ordering::SeqCst) - 6; // Leave room for 5x5 cursor
+                let max_y = polymorph_os::splat::SCREEN_HEIGHT.load(Ordering::SeqCst) - 6;
+
                 cx += x_mov;
                 cy -= y_mov;
-                cx = cx.clamp(0, 1274);
-                cy = cy.clamp(0, 794);
+                
+                // No more hardcoded 1274/794!
+                cx = cx.clamp(0, max_x);
+                cy = cy.clamp(0, max_y);
 
                 polymorph_os::splat::CURSOR_X.store(cx, Ordering::SeqCst);
                 polymorph_os::splat::CURSOR_Y.store(cy, Ordering::SeqCst);

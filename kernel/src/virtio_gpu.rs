@@ -259,7 +259,7 @@ impl VirtioGpuDriver {
 
     /// [MICT: THE FIRST MAIL]
     /// Asks the GPU for the physical dimensions of the monitor.
-    pub unsafe fn get_display_info(&mut self) -> Result<(), &'static str> {
+    pub unsafe fn get_display_info(&mut self) -> Result<(u32, u32), &'static str> {
         let mailbox_virt = self.mailbox_virt.expect("Mailbox missing!");
         let mailbox_phys = self.mailbox_phys.expect("Mailbox missing!");
         let vq_virt = self.control_queue_virt.expect("Control Queue missing!");
@@ -324,22 +324,27 @@ impl VirtioGpuDriver {
 
         // 7. OPEN THE ENVELOPE!
         let response = &*resp_ptr;
-        if response.header.ty == CommandTy::RespOkDisplayInfo {
+        
+        // Temporarily hold the result so we can clean up memory before returning!
+        let result = if response.header.ty == CommandTy::RespOkDisplayInfo {
             let display = &response.display_info[0];
             crate::serial_println!(
                 "[VIRTIO] 📬 GPU Reply Received! Monitor 0 is {}x{} at (X:{}, Y:{})",
                 display.rect.width, display.rect.height, display.rect.x, display.rect.y
             );
+            Ok((display.rect.width, display.rect.height))
         } else {
             crate::serial_println!("[VIRTIO] 🛑 GPU returned error code: {:?}", response.header.ty);
-        }
-        // [MICT: RECLAIM DESCRIPTORS]
+            Err("Failed to get display info")
+        };
+
+        //[MICT: RECLAIM DESCRIPTORS]
         vq.descriptors[next_idx].next = vq.free_head;
         vq.free_head = head_idx as u16;
         vq.num_free += 2;
 
-        Ok(())
-        
+        // Finally, return the tuple!
+        result
     }
     
     // Helper to generate unique IDs for our canvases

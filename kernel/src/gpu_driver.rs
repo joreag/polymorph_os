@@ -59,6 +59,24 @@ impl GpuDriver {
         }
     }
 
+    ///[MICT: DYNAMIC RESOLUTION]
+    /// Morphs the software buffers to perfectly match the physical hardware monitor.
+    pub fn resize_to_hardware(&mut self, new_width: usize, new_height: usize) {
+        if self.width == new_width && self.height == new_height {
+            return; // Already perfectly sized
+        }
+        
+        crate::serial_println!("[GPU DRIVER] Morphing internal buffers to {}x{}...", new_width, new_height);
+        
+        self.width = new_width;
+        self.height = new_height;
+        let new_size = new_width * new_height * self.bytes_per_pixel;
+        
+        // Reallocate the vectors in our O(1) MICT Memory!
+        self.back_buffer = alloc::vec![0; new_size];
+        self.nebula_buffer = alloc::vec![0; new_size];
+    }
+
     //[MICT: OFF-SCREEN SAFE FROSTED GLASS]
     pub fn draw_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: u8, g: u8, b: u8, alpha: u8) {
         if alpha == 0 { return; }

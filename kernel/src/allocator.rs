@@ -17,7 +17,7 @@ use x86_64::{
 pub mod mict_global_allocator; // Your custom hardware architecture
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 20 * 1024 * 1024; // 10 MiB
+pub const HEAP_SIZE: usize = 64 * 1024 * 1024; // 10 MiB
 
 // The Kernel Global Allocator is now powered by MICT-Elastic logic.
 #[global_allocator]

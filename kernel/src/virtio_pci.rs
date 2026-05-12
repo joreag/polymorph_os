@@ -155,41 +155,61 @@ pub fn init_virtio_device(
         core::ptr::write_volatile(status_ptr, status);
         crate::serial_println!("[VIRTIO] Handshake Complete. DRIVER_OK set. Device is LIVE.");
 
-        // [MICT: SEND THE FIRST COMMAND]
-        if let Err(e) = gpu_driver.get_display_info() {
-            crate::serial_println!("[VIRTIO FATAL] Failed to send command: {}", e);
+        //[MICT: THE SOVEREIGN RESOLUTION]
+        // We do NOT ask the hypervisor anymore. We COMMAND the hypervisor.
+        let screen_w: u32 = 1920;
+        let screen_h: u32 = 1080;
+
+        crate::serial_println!("[VIRTIO] Forcing Sovereign Resolution: {}x{}", screen_w, screen_h);
+
+        // Tell the mouse driver the new limits!
+        crate::splat::SCREEN_WIDTH.store(screen_w as i32, core::sync::atomic::Ordering::SeqCst);
+        crate::splat::SCREEN_HEIGHT.store(screen_h as i32, core::sync::atomic::Ordering::SeqCst);
+
+        // 1. Resize the internal software buffers to match our 1080p canvas
+        if let Some(gpu) = crate::gpu_driver::GPU_WRITER.lock().as_mut() {
+            gpu.resize_to_hardware(screen_w as usize, screen_h as usize);
         }
 
-        // --- THE MICT COMPOSITOR INITIALIZATION ---
-        
-        // 1. Get the TRUE screen resolution from the active GpuDriver!
-        let mut screen_w = 800;
-        let mut screen_h = 600;
-        if let Some(gpu) = crate::gpu_driver::GPU_WRITER.lock().as_ref() {
-            screen_w = gpu.width as u32;
-            screen_h = gpu.height as u32;
+        // 2. Tame Godzilla & Center the Nebula
+        if let Some(engine) = crate::splat::SPLAT_ENGINE.lock().as_mut() {
+            if let Some(win) = &mut engine.active_window {
+                win.w = ((screen_w as f32) * 0.4) as i32;
+                win.h = ((screen_h as f32) * 0.4) as i32;
+                let center_x = ((screen_w as i32) - win.w) / 2;
+                let center_y = ((screen_h as i32) - win.h) / 2;
+                win.move_to(center_x, center_y); 
+            }
+            
+            let true_cx = (screen_w / 2) as i32;
+            let true_cy = (screen_h / 2) as i32;
+            
+            if engine.nebula_splats.len() >= 2 {
+                engine.nebula_splats[0].x = true_cx - 200;
+                engine.nebula_splats[0].y = true_cy - 100;
+                engine.nebula_splats[1].x = true_cx + 200;
+                engine.nebula_splats[1].y = true_cy + 100;
+            }
         }
 
-        // 2. Create the Canvas using the exact dimensions
+        // 3. Create the Hardware Canvas
         if let Err(e) = gpu_driver.create_2d_canvas(1, screen_w, screen_h) {
             crate::serial_println!("[VIRTIO FATAL] {}", e);
         }
 
-        // 3. Calculate exactly how many 4KB pages we need for the screen RAM
+        // 4. Allocate the DMA Backing Memory
         let bytes_needed = (screen_w * screen_h * 4) as u64;
         let pages_needed = ((bytes_needed + 4095) / 4096) as usize;
 
         if let Some((phys_back_buffer, virt_back_buffer)) = crate::memory::allocate_dma_frames(frame_allocator, phys_mem_offset, pages_needed) {
             
-            // Save the Virtual Address globally so gpu_driver.rs can find it!
+            crate::serial_println!("[VIRTIO] Allocated {} pages for DMA Backing Store.", pages_needed);
             crate::virtio_gpu::VIRTIO_BACKING_VIRT.store(virt_back_buffer.as_u64(), core::sync::atomic::Ordering::SeqCst);
 
-            // Attach it to the GPU
             if let Err(e) = gpu_driver.attach_backing(1, phys_back_buffer.as_u64(), bytes_needed as u32) {
                  crate::serial_println!("[VIRTIO FATAL] {}", e);
             }
             
-            // Seize the Monitor!
             if let Err(e) = gpu_driver.set_scanout(0, 1, screen_w, screen_h) {
                  crate::serial_println!("[VIRTIO FATAL] {}", e);
             }
@@ -199,7 +219,6 @@ pub fn init_virtio_device(
             crate::serial_println!("[VIRTIO FATAL] Failed to allocate RAM for the back buffer.");
         }
 
-        // Lock the driver into the global state
         *crate::virtio_gpu::VIRTIO_GPU.lock() = Some(gpu_driver);
     }
     Ok(())

@@ -7,11 +7,20 @@ use core::sync::atomic::{AtomicI32, AtomicBool, Ordering};
 
 
 pub static SPLAT_ENGINE: Mutex<Option<SplatEngine>> = Mutex::new(None);
+// [MICT: LAZY RENDERING]
+pub static DIRTY_SCREEN: AtomicBool = AtomicBool::new(true);
 
 // [MICT: GLOBAL UI STATE]
-pub static CURSOR_X: AtomicI32 = AtomicI32::new(640);
-pub static CURSOR_Y: AtomicI32 = AtomicI32::new(400);
+//[MICT: GLOBAL UI STATE]
+pub static CURSOR_X: AtomicI32 = AtomicI32::new(960);
+pub static CURSOR_Y: AtomicI32 = AtomicI32::new(540);
 pub static LEFT_CLICK: AtomicBool = AtomicBool::new(false);
+pub static IS_DRAGGING: AtomicBool = AtomicBool::new(false);
+pub static DRAG_OFFSET_X: AtomicI32 = AtomicI32::new(0);
+pub static DRAG_OFFSET_Y: AtomicI32 = AtomicI32::new(0);
+
+pub static SCREEN_WIDTH: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(800);
+pub static SCREEN_HEIGHT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(600);
 
 #[derive(Clone, Copy)]
 pub struct GaussianSplat {
@@ -19,37 +28,135 @@ pub struct GaussianSplat {
     pub r: u8, pub g: u8, pub b: u8, pub opacity: u8,
 }
 
-// [MICT: THE AMORPHOUS WINDOW]
+/// [MICT: THE UNIVERSAL SPLAT RENDERER]
+/// Renders a single 3D Gaussian math equation into pixels on the screen.
+pub fn render_single_splat(gpu: &mut crate::gpu_driver::GpuDriver, splat: &GaussianSplat) {
+    let radius = splat.scale * 2; 
+    let min_x = core::cmp::max(0, splat.x - radius);
+    let max_x = core::cmp::min(gpu.width as i32, splat.x + radius);
+    let min_y = core::cmp::max(0, splat.y - radius);
+    let max_y = core::cmp::min(gpu.height as i32, splat.y + radius);
+
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let dx = px - splat.x;
+            let dy = py - splat.y;
+            let dist_sq = (dx * dx) + (dy * dy);
+            
+            // Gaussian Falloff Equation
+            let scale_factor = (splat.scale * splat.scale / 128).max(1);
+            let falloff = dist_sq / scale_factor;
+            
+            if falloff < 255 {
+                let intensity = 255 - falloff as u32;
+                let alpha = (intensity * splat.opacity as u32) / 255;
+                if alpha > 0 {
+                    gpu.blend_pixel(px, py, splat.r, splat.g, splat.b, alpha as u8);
+                }
+            }
+        }
+    }
+}
+
+//[MICT: THE NON-EUCLIDEAN WINDOW]
 pub struct SemanticWindow {
     pub x: i32, pub y: i32, pub w: i32, pub h: i32,
     pub text_buffer: String,
-    pub input_buffer: String, //[MICT: THE COMMAND BUFFER]
+    pub input_buffer: String,
+    pub scroll_offset: usize,
+    pub splat_cloud: Vec<GaussianSplat>, // <-- THE ORGANIC BODY
 }
 
 impl SemanticWindow {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
-        // No more blobs! Just coordinates and text buffers.
-        SemanticWindow { 
+        let mut win = SemanticWindow { 
             x, y, w, h, 
-            text_buffer: String::from("Welcome to GenesisOS. Type HELP for commands.\n"),
+            text_buffer: String::from("Welcome to PolymorphOS. Type HELP for commands.\n"),
             input_buffer: String::new(),
+            scroll_offset: 0,
+            splat_cloud: Vec::new(),
+        };
+        win.generate_cloud();
+        win
+    }
+
+    ///[MICT: PROCEDURAL MORPHOLOGY v7 (The Tight UI)]
+    pub fn generate_cloud(&mut self) {
+        self.splat_cloud.clear();
+        
+        let cx = self.x + (self.w / 2);
+        let cy = self.y + (self.h / 2);
+
+        // --- 1. THE DARK CORE (Tucked inside the borders) ---
+        let corner_scale = (self.w / 4).min(self.h / 4) - 10; 
+        // Pull the centers further inward so the radius doesn't bleed out!
+        let padding = corner_scale + 10; 
+
+        let core_r = 5; let core_g = 10; let core_b = 15; 
+        let core_opacity = 220; 
+        
+        self.splat_cloud.push(GaussianSplat { x: self.x + padding, y: self.y + padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
+        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - padding, y: self.y + padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
+        self.splat_cloud.push(GaussianSplat { x: self.x + padding, y: self.y + self.h - padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
+        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - padding, y: self.y + self.h - padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
+
+        // Center Filler
+        self.splat_cloud.push(GaussianSplat { 
+            x: cx, y: cy, z: 10, 
+            scale: (self.w / 2).min(self.h / 2), 
+            r: core_r, g: core_g, b: core_b, 
+            opacity: core_opacity 
+        });
+
+        // --- 2. THE GLOWING BORDER (Zero Scalloping) ---
+        let node_spacing = 8; // Halved the spacing to pack the splats tightly together
+        let border_scale = 16; // Shrunk the radius so it forms a tight line
+        
+        let num_x_nodes = self.w / node_spacing;
+        for i in 0..=num_x_nodes {
+            let px = self.x + (i * node_spacing);
+            self.splat_cloud.push(GaussianSplat { x: px, y: self.y, z: 12, scale: border_scale, r: 0, g: 255, b: 200, opacity: 120 }); // Top
+            self.splat_cloud.push(GaussianSplat { x: px, y: self.y + self.h, z: 12, scale: border_scale, r: 0, g: 100, b: 255, opacity: 90 }); // Bottom
         }
+
+        let num_y_nodes = self.h / node_spacing;
+        for i in 0..=num_y_nodes {
+            let py = self.y + (i * node_spacing);
+            self.splat_cloud.push(GaussianSplat { x: self.x, y: py, z: 12, scale: border_scale, r: 0, g: 150, b: 255, opacity: 90 }); // Left
+            self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: py, z: 12, scale: border_scale, r: 0, g: 150, b: 255, opacity: 90 }); // Right
+        }
+
+        // --- 3. THE CORNER ANCHORS ---
+        let anchor_scale = 30; // Shrunk to match the tighter borders
+        self.splat_cloud.push(GaussianSplat { x: self.x, y: self.y, z: 13, scale: anchor_scale, r: 0, g: 255, b: 255, opacity: 180 });
+        self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: self.y, z: 13, scale: anchor_scale, r: 0, g: 255, b: 255, opacity: 180 });
+        self.splat_cloud.push(GaussianSplat { x: self.x, y: self.y + self.h, z: 13, scale: anchor_scale, r: 50, g: 100, b: 255, opacity: 150 });
+        self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: self.y + self.h, z: 13, scale: anchor_scale, r: 50, g: 100, b: 255, opacity: 150 });
+
+        // --- 4. PROCEDURAL WINDOW CONTROLS ---
+        // Close Button (Red)
+        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 25, y: self.y + 5, z: 14, scale: 12, r: 255, g: 50, b: 50, opacity: 200 });
+        // Minimize Button (Yellow)
+        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 55, y: self.y + 5, z: 14, scale: 12, r: 255, g: 200, b: 50, opacity: 200 });
     }
 
     pub fn move_to(&mut self, new_x: i32, new_y: i32) {
         self.x = new_x;
         self.y = new_y;
+        self.generate_cloud(); // Morph to the new location!
     }
 
-    //[MICT: THE SLEEK UI]
-    pub fn render_body(&self, gpu: &mut GpuDriver) {
-        // No more 'as usize' danger! Pass the raw i32 coordinates.
-        gpu.draw_glass_rect(self.x, self.y, self.w, self.h, 10, 20, 30, 200);
-        gpu.draw_glass_rect(self.x, self.y, self.w, 30, 40, 80, 100, 255);
+    //[MICT: THE NEW ORGANIC RENDERER]
+    pub fn render_body(&self, gpu: &mut crate::gpu_driver::GpuDriver) {
+        // We draw the cloud instead of a rigid glass rectangle!
+        for splat in &self.splat_cloud {
+            render_single_splat(gpu, splat);
+        }
     }
 
 // [MICT: THE COMMAND EXECUTOR]
 pub fn execute_command(&mut self) {
+    crate::splat::DIRTY_SCREEN.store(true, Ordering::SeqCst);
     let raw_input = self.input_buffer.trim().to_uppercase(); 
     
     // Echo the user's command to BOTH the local screen and the remote terminal
@@ -207,6 +314,7 @@ pub fn execute_command(&mut self) {
 
     // [MICT: THE NEW DEDICATED KEYBOARD ROUTER]
     pub fn process_keystroke(&mut self, c: char) {
+        crate::splat::DIRTY_SCREEN.store(true, Ordering::SeqCst);
         if c == '\x08' {
             // Backspace deletes from the current input buffer
             self.input_buffer.pop();
@@ -219,59 +327,70 @@ pub fn execute_command(&mut self) {
         }
     }
 
-// [MICT: THE NEW TEXT RENDERER - ZERO ALLOCATION PHYSICAL WRAP]
-    pub fn render_text(&self, gpu: &mut GpuDriver) {
+//[MICT: THE NEW TEXT RENDERER - ZERO ALLOCATION PHYSICAL WRAP]
+    pub fn render_text(&self, gpu: &mut crate::gpu_driver::GpuDriver) {
         use font8x8::legacy::BASIC_LEGACY;
         
-        // 1. Calculate bounding box parameters
-        let max_lines = ((self.h - 50) / 12) as usize; 
-        let max_chars_per_line = ((self.w - 20) / 8) as usize;
+        // [FIXED] Subtract 60 (30px left padding + 30px right padding) to stop the overrun!
+        let max_chars_per_line = ((self.w - 60) / 8).max(1) as usize; 
+        let max_lines = ((self.h - 60) / 12).max(1) as usize; 
         
-        // 2. Combine history + prompt + current input
+        // Combine history + prompt + current input
         let mut display_text = self.text_buffer.clone();
         display_text.push_str("genesis> ");
         display_text.push_str(&self.input_buffer);
-        display_text.push('\u{2588}'); // Unicode Solid Block Cursor
+        display_text.push('\u{2588}'); 
         
-        // --- PASS 1: Count total physical lines mathematically ---
+        // --- DRAW TITLE BAR TEXT ---
+        let title = "PolymorphOS Sovereign Terminal";
+        let mut title_x = self.x + 30;
+        let title_y = self.y + 2;
+        for c in title.chars() {
+            let c_val = c as usize;
+            if c_val < 128 {
+                for (y, row) in BASIC_LEGACY[c_val].iter().enumerate() {
+                    for x in 0..8 {
+                        if (*row & (1 << x)) != 0 {
+                            gpu.draw_pixel(title_x + x as i32, title_y + y as i32, 180, 255, 255); // Cyan title text
+                        }
+                    }
+                }
+            }
+            title_x += 8;
+        }
+
+        // --- DRAW TERMINAL TEXT ---
         let mut total_physical_lines = 0;
         for logical_line in display_text.split('\n') {
             let char_count = logical_line.chars().count();
             if char_count == 0 {
-                total_physical_lines += 1; // Empty lines still take 1 physical line
+                total_physical_lines += 1; 
             } else {
-                // Integer division rounding up
                 total_physical_lines += (char_count + max_chars_per_line - 1) / max_chars_per_line;
             }
         }
 
-        // Determine exactly how many physical lines to skip to stick to the bottom
         let mut skip_lines = if total_physical_lines > max_lines {
             total_physical_lines - max_lines
         } else {
             0
         };
 
-        // --- PASS 2: Execute the draw, skipping lines that are scrolled off-screen ---
+        // Start text further down to make room for the Title Bar and Buttons
         let mut cy = self.y + 40; 
         
         for logical_line in display_text.split('\n') {
-            let mut cx = self.x + 10;
+            let mut cx = self.x + 30; // 30px Left Padding
             let mut char_count = 0;
             
             for c in logical_line.chars() {
-                // If we hit the boundary, we are starting a NEW physical line
                 if char_count > 0 && char_count % max_chars_per_line == 0 {
-                    if skip_lines > 0 {
-                        skip_lines -= 1; // Discard a skipped line
-                    } else {
-                        cy += 12; // Actually move the cursor down
-                    }
-                    cx = self.x + 10; // Carriage return
+                    if skip_lines > 0 { skip_lines -= 1; } else { cy += 12; }
+                    cx = self.x + 30; // Return to left padding margin
                 }
 
-                // Only draw the pixel if we are within the visible window
-                if skip_lines == 0 {
+                // Clip text from bleeding out the bottom
+                if skip_lines == 0 && cy < self.y + self.h - 15 {
                     let c_val = c as usize;
                     if c_val < 128 || c == '\u{2588}' {
                         let bitmap = if c == '\u{2588}' {[255; 8] } else { BASIC_LEGACY[c_val] }; 
@@ -288,12 +407,7 @@ pub fn execute_command(&mut self) {
                 char_count += 1;
             }
             
-            // Finalize the logical line (acting as the physical \n stroke)
-            if skip_lines > 0 {
-                skip_lines -= 1;
-            } else {
-                cy += 12;
-            }
+            if skip_lines > 0 { skip_lines -= 1; } else { cy += 12; }
         }
     }
 }
@@ -312,40 +426,21 @@ impl SplatEngine {
         self.nebula_splats.push(splat);
     }
 
-    pub fn render(&mut self, gpu: &mut GpuDriver) {
-        // 1. Render Nebula
+        pub fn render(&mut self, gpu: &mut crate::gpu_driver::GpuDriver) {
+        // 1. Render Background Nebula
         self.nebula_splats.sort_by(|a, b| a.z.cmp(&b.z));
         for splat in &self.nebula_splats {
-            let radius = splat.scale * 2; 
-            let min_x = core::cmp::max(0, splat.x - radius);
-            let max_x = core::cmp::min(gpu.width as i32, splat.x + radius);
-            let min_y = core::cmp::max(0, splat.y - radius);
-            let max_y = core::cmp::min(gpu.height as i32, splat.y + radius);
-
-            for py in min_y..max_y {
-                for px in min_x..max_x {
-                    let dx = px - splat.x;
-                    let dy = py - splat.y;
-                    let dist_sq = (dx * dx) + (dy * dy);
-                    let falloff = dist_sq / (splat.scale * splat.scale / 128).max(1);
-                    if falloff < 255 {
-                        let intensity = 255 - falloff as u32;
-                        let alpha = (intensity * splat.opacity as u32) / 255;
-                        if alpha > 0 {
-                            gpu.blend_pixel(px, py, splat.r, splat.g, splat.b, alpha as u8);
-                        }
-                    }
-                }
-            }
+            render_single_splat(gpu, splat); // <-- Much cleaner now!
         }
 
-        // 2. Render Window & Text
+        // 2. Render Active Window Cloud & Text
         if let Some(win) = &mut self.active_window {
             win.render_body(gpu);
-            win.render_text(gpu); // [MICT: DRAW THE TEXT!]
+            win.render_text(gpu); 
         }
     }
 }
+
 
 //[MICT: THE SYSTEM LOGGER (Restored!)]
 impl fmt::Write for SplatEngine {
@@ -364,14 +459,42 @@ impl fmt::Write for SplatEngine {
 }
 
 //[MICT: THE UNIVERSAL COMPOSITOR]
-// This function instantly pastes the Nebula, draws the Window, draws the Cursor, and Flips!
-pub fn render_desktop(gpu: &mut GpuDriver, engine: &mut SplatEngine) {
+pub fn render_desktop(gpu: &mut crate::gpu_driver::GpuDriver, engine: &mut SplatEngine) {
     let cx = CURSOR_X.load(Ordering::SeqCst);
     let cy = CURSOR_Y.load(Ordering::SeqCst);
     let clicked = LEFT_CLICK.load(Ordering::SeqCst);
     let (cr, cg, cb) = if clicked { (255, 50, 50) } else { (255, 255, 255) };
 
-    gpu.restore_from_nebula_cache(); 
+    // ---[MICT: DRAG AND DROP PHYSICS] ---
+    if let Some(win) = &mut engine.active_window {
+        let is_dragging = IS_DRAGGING.load(Ordering::SeqCst);
+
+        if clicked {
+            // Check if we just clicked the top "Title Bar" area of the window
+            if !is_dragging && cx >= win.x && cx <= win.x + win.w && cy >= win.y && cy <= win.y + 40 {
+                // Lock the drag state and record where on the window we clicked
+                IS_DRAGGING.store(true, Ordering::SeqCst);
+                DRAG_OFFSET_X.store(cx - win.x, Ordering::SeqCst);
+                DRAG_OFFSET_Y.store(cy - win.y, Ordering::SeqCst);
+            } 
+            
+            // If we are currently dragging, move the window!
+            if IS_DRAGGING.load(Ordering::SeqCst) {
+                let off_x = DRAG_OFFSET_X.load(Ordering::SeqCst);
+                let off_y = DRAG_OFFSET_Y.load(Ordering::SeqCst);
+                
+                // Call the procedural morph function!
+                win.move_to(cx - off_x, cy - off_y); 
+            }
+        } else {
+            // Mouse button released, drop the window
+            if is_dragging {
+                IS_DRAGGING.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+        gpu.restore_from_nebula_cache(); 
     
     if let Some(win) = &mut engine.active_window {
         win.render_body(gpu);
