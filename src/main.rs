@@ -34,7 +34,7 @@ fn main() {
     
     cmd.arg("-no-reboot");
     cmd.arg("-no-shutdown");
-    cmd.arg("-serial").arg("tcp:127.0.0.1:4444,server=on,wait=on");
+    cmd.arg("-serial").arg("tcp:127.0.0.1:4444,server=on,wait=off");
 
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     
