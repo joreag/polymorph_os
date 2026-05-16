@@ -117,21 +117,23 @@ fn check_device(
             crate::serial_println!("     -> E1000 Physical Base: {:#010X}", mmio_base);
             
             // [MICT: MEMORY MAPPING] - Map the E1000 registers!
-            // E1000 requires 128KB (0x20000) of mapped space for all registers.
             unsafe { 
                 if let Err(e) = crate::memory::map_mmio(mmio_base, 0x20000, mapper, frame_allocator) {
                     crate::serial_println!("     -> [FATAL] Failed to map E1000 MMIO: {:?}", e);
                 } else {
-                    crate::serial_println!("     -> [OK] E1000 MMIO Mapped.");
+                    crate::serial_println!("     ->[OK] E1000 MMIO Mapped.");
                     
-                    // Now that it's safely in the Page Tables, we can wake the driver!
-                    let driver = crate::e1000::E1000Driver::new(mmio_base as usize); 
+                    // --- THE UPDATE: Pass the frame allocator and offset! ---
+                    let driver = crate::e1000::E1000Driver::new(mmio_base as usize, frame_allocator, phys_mem_offset); 
+                    
                     *crate::e1000::E1000_NET.lock() = Some(driver);
                     crate::serial_println!("     -> [OK] Intel E1000 Driver Initialized and Locked.");
+                    
                 }
             }
         }
     }
+    
 
     // --- TARGET 3: VIRTIO GPU ---
     else if vendor_id == 0x1AF4 && device_id == 0x1050 {
@@ -145,6 +147,9 @@ fn check_device(
             crate::serial_println!("     -> [OK] VirtIO Handshake process started.");
         }
     }
+
+    
+
 }
 
 /// [MICT: DYNAMIC RADAR] - Sweeps the PCIe bus in real-time without initializing drivers.

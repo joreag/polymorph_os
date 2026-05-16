@@ -1,4 +1,7 @@
+// kernel/src/mfs.rs
+
 use crate::nvme::NVME_DRIVE;
+use crate::mdo_vm::MdoContext; // <<< Imported our new VM
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::str;
@@ -116,21 +119,106 @@ impl MictFileSystem {
         None
     }
 
-    /// Locates the file in the MFT, then fetches all its data blocks.
-    pub fn read_file(filename: &str) -> Result<Vec<u8>, &'static str> {
+        // --- [MICT: THE ZERO-TRUST SECURITY GATE] ---
+    /// Reads the MDO Header from the disk, extracts the bytecode, and forces
+    /// the Virtual Machine to evaluate the request context.
+    fn verify_mdo_access(start_lba: u64, context: &MdoContext) -> Result<usize, &'static str> {
+        let mut nvme_lock = NVME_DRIVE.lock();
+        let nvme = nvme_lock.as_mut().ok_or("NVMe offline")?;
+        
+        let mut first_block = [0u8; 4096];
+        nvme.read_block(start_lba, &mut first_block).map_err(|_| "Hardware read failed")?;
+        
+        // 1. Check Magic Number: MDO\x01
+        if first_block[0..4] != [0x4D, 0x44, 0x4F, 0x01] {
+            return Err("Not a valid MDO file. Zero-Trust Access Denied.");
+        }
+
+        // 2. Extract Bytecode Length
+        let bytecode_len = u32::from_le_bytes(first_block[76..80].try_into().unwrap()) as usize;
+        if bytecode_len > 3968 { return Err("Corrupted MDO: Bytecode too large."); }
+        
+        // 3. Extract the actual Opcode instructions
+        let bytecode = &first_block[128 .. 128 + bytecode_len];
+
+        // 4. THE MICT EVALUATION
+        // The Kernel pauses, spinning up the 1KB VM stack to run the script.
+        if let Err(error_code) = crate::mdo_vm::execute_mict_check(bytecode, context) {
+            crate::serial_println!("[DISSONANCE] MFS Policy Rejected. Error Code: 0x{:02X}", error_code);
+            return Err("Access Denied by MDO Security Policy");
+        }
+
+        // Return the payload offset so the caller knows where the actual data begins!
+        Ok(128 + bytecode_len)
+    }
+
+    /// [MICT: SECURE READ]
+    pub fn read_file(filename: &str, context: &MdoContext) -> Result<Vec<u8>, &'static str> {
         if let Some(entry) = Self::find_file(filename) {
+            
+            // GATE CHECK: Throws an error if the VM rejects the context!
+            let payload_start_offset = Self::verify_mdo_access(entry.start_lba, context)?;
             
             let mut file_data = Vec::with_capacity((entry.block_count * 4096) as usize);
             let mut nvme_lock = NVME_DRIVE.lock();
             let nvme = nvme_lock.as_mut().ok_or("NVMe offline")?;
 
-            for i in 0..entry.block_count {
-                let mut buffer = [0u8; 4096];
+            // Read the first block, but only extract data AFTER the bytecode
+            let mut buffer = [0u8; 4096];
+            nvme.read_block(entry.start_lba, &mut buffer).map_err(|_| "Hardware read failed")?;
+            file_data.extend_from_slice(&buffer[payload_start_offset..]);
+
+            // Read any subsequent blocks natively
+            for i in 1..entry.block_count {
                 nvme.read_block(entry.start_lba + i, &mut buffer).map_err(|_| "Hardware read failed")?;
                 file_data.extend_from_slice(&buffer);
             }
             
             Ok(file_data)
+        } else {
+            Err("File not found")
+        }
+    }
+
+    /// [MICT: SECURE DELETE]
+    pub fn delete_file(filename: &str, context: &MdoContext) -> Result<(), &'static str> {
+        let mut entries = Self::read_mft()?;
+        
+        if let Some(pos) = entries.iter().position(|e| e.name == filename) {
+            let entry = &entries[pos];
+
+            // GATE CHECK: Can this user delete this file?
+            Self::verify_mdo_access(entry.start_lba, context)?;
+
+            // If the VM says Ok(()), we are allowed to alter the MFT
+            entries.remove(pos);
+            Self::write_mft(&entries)?;
+            crate::serial_println!("  -> [OK] File '{}' securely deleted.", filename);
+            Ok(())
+        } else {
+            Err("File not found")
+        }
+    }
+
+    /// [MICT: SECURE MOVE/RENAME]
+    pub fn rename_file(old_name: &str, new_name: &str, context: &MdoContext) -> Result<(), &'static str> {
+        let mut entries = Self::read_mft()?;
+        
+        if entries.iter().any(|e| e.name == new_name) {
+            return Err("Target filename already exists.");
+        }
+
+        if let Some(pos) = entries.iter().position(|e| e.name == old_name) {
+            let entry = &mut entries[pos];
+
+            // GATE CHECK: Can this user move this file?
+            Self::verify_mdo_access(entry.start_lba, context)?;
+
+            // If the VM says Ok(()), we are allowed to alter the MFT
+            entry.name = new_name.to_string();
+            Self::write_mft(&entries)?;
+            crate::serial_println!("  -> [OK] File '{}' renamed to '{}'.", old_name, new_name);
+            Ok(())
         } else {
             Err("File not found")
         }

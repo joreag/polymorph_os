@@ -82,17 +82,18 @@ pub async fn print_keypresses() {
             if let Some(key) = keyboard.process_keyevent(key_event) {
                 match key {
                     DecodedKey::Unicode(character) => {
-                        //[MICT: DIRECT UI INTERACTION]
+                        // [MICT: DIRECT UI INTERACTION]
                         x86_64::instructions::interrupts::without_interrupts(|| {
                             let mut gpu_lock = crate::gpu_driver::GPU_WRITER.lock();
                             let mut engine_lock = crate::splat::SPLAT_ENGINE.lock();
-                            
                             if let (Some(gpu), Some(engine)) = (gpu_lock.as_mut(), engine_lock.as_mut()) {
-                                // 1. Send the keystroke to the active window
-                                if let Some(win) = &mut engine.active_window {
+                                
+                                // Route typing to the top-most window
+                                if let Some(win) = engine.windows.last_mut() {
                                     win.process_keystroke(character);
                                 }
-                                // 2. Instantly flip the 4MB screen buffer!
+                                
+                                // [FIXED] Instant Redraw! Zero typing latency.
                                 crate::splat::render_desktop(gpu, engine);
                             }
                         });

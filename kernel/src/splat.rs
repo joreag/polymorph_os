@@ -1,3 +1,5 @@
+// kernel/src/splat.rs
+
 use crate::gpu_driver::GpuDriver;
 use alloc::vec::Vec;
 use alloc::string::String;
@@ -5,15 +7,12 @@ use spin::Mutex;
 use core::fmt;
 use core::sync::atomic::{AtomicI32, AtomicBool, Ordering};
 
-
 pub static SPLAT_ENGINE: Mutex<Option<SplatEngine>> = Mutex::new(None);
-// [MICT: LAZY RENDERING]
 pub static DIRTY_SCREEN: AtomicBool = AtomicBool::new(true);
 
 // [MICT: GLOBAL UI STATE]
-//[MICT: GLOBAL UI STATE]
-pub static CURSOR_X: AtomicI32 = AtomicI32::new(960);
-pub static CURSOR_Y: AtomicI32 = AtomicI32::new(540);
+pub static CURSOR_X: AtomicI32 = AtomicI32::new(400);
+pub static CURSOR_Y: AtomicI32 = AtomicI32::new(300);
 pub static LEFT_CLICK: AtomicBool = AtomicBool::new(false);
 pub static IS_DRAGGING: AtomicBool = AtomicBool::new(false);
 pub static DRAG_OFFSET_X: AtomicI32 = AtomicI32::new(0);
@@ -24,28 +23,50 @@ pub static SCREEN_HEIGHT: core::sync::atomic::AtomicI32 = core::sync::atomic::At
 
 #[derive(Clone, Copy)]
 pub struct GaussianSplat {
-    pub x: i32, pub y: i32, pub z: i32, pub scale: i32,
+    pub x: i32, pub y: i32, pub z: i32, 
+    pub scale_x: i32, pub scale_y: i32, // The Anisotropic Upgrade!
     pub r: u8, pub g: u8, pub b: u8, pub opacity: u8,
 }
 
-/// [MICT: THE UNIVERSAL SPLAT RENDERER]
-/// Renders a single 3D Gaussian math equation into pixels on the screen.
-pub fn render_single_splat(gpu: &mut crate::gpu_driver::GpuDriver, splat: &GaussianSplat) {
-    let radius = splat.scale * 2; 
-    let min_x = core::cmp::max(0, splat.x - radius);
-    let max_x = core::cmp::min(gpu.width as i32, splat.x + radius);
-    let min_y = core::cmp::max(0, splat.y - radius);
-    let max_y = core::cmp::min(gpu.height as i32, splat.y + radius);
+/// [MICT: TRUE 3D HOLOGRAPHIC RENDERER]
+pub fn render_single_splat(gpu: &mut GpuDriver, splat: &GaussianSplat) {
+    // --- 1. PERSPECTIVE PROJECTION ---
+    let focal_length = 500;
+    let camera_z = -500; // The camera is sitting 500 units "in front" of the screen
+    
+    let z_dist = splat.z - camera_z;
+    if z_dist <= 0 { return; } // Splat is behind the camera, don't draw it!
+    
+    let screen_cx = gpu.width as i32 / 2;
+    let screen_cy = gpu.height as i32 / 2;
 
+    // Project 3D coordinates into 2D screen space based on distance
+    let proj_x = screen_cx + ((splat.x - screen_cx) * focal_length) / z_dist;
+    let proj_y = screen_cy + ((splat.y - screen_cy) * focal_length) / z_dist;
+    
+    let proj_scale_x = (splat.scale_x * focal_length) / z_dist;
+    let proj_scale_y = (splat.scale_y * focal_length) / z_dist;
+
+    // --- 2. BOUNDING BOX ---
+    let radius_x = proj_scale_x * 2;
+    let radius_y = proj_scale_y * 2;
+    
+    let min_x = core::cmp::max(0, proj_x - radius_x);
+    let max_x = core::cmp::min(gpu.width as i32, proj_x + radius_x);
+    let min_y = core::cmp::max(0, proj_y - radius_y);
+    let max_y = core::cmp::min(gpu.height as i32, proj_y + radius_y);
+
+    // --- 3. ANISOTROPIC COVARIANCE (The Ellipse Math) ---
     for py in min_y..max_y {
         for px in min_x..max_x {
-            let dx = px - splat.x;
-            let dy = py - splat.y;
-            let dist_sq = (dx * dx) + (dy * dy);
+            let dx = px - proj_x;
+            let dy = py - proj_y;
             
-            // Gaussian Falloff Equation
-            let scale_factor = (splat.scale * splat.scale / 128).max(1);
-            let falloff = dist_sq / scale_factor;
+            let scale_fac_x = (proj_scale_x * proj_scale_x / 128).max(1);
+            let scale_fac_y = (proj_scale_y * proj_scale_y / 128).max(1);
+            
+            // Calculates an ellipse instead of a perfect circle!
+            let falloff = (dx * dx) / scale_fac_x + (dy * dy) / scale_fac_y;
             
             if falloff < 255 {
                 let intensity = 255 - falloff as u32;
@@ -58,101 +79,170 @@ pub fn render_single_splat(gpu: &mut crate::gpu_driver::GpuDriver, splat: &Gauss
     }
 }
 
-//[MICT: THE NON-EUCLIDEAN WINDOW]
+// --- [MICT: THE INSTANTIATION STATE MACHINE] ---
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowMode {
+    Instantiated, // Normal floating window
+    Maximized,    // Fullscreen
+    Dead,         // Ready to be deleted from RAM
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowState {
+    Stable(WindowMode),
+    Transitioning { 
+        progress: i32, max: i32, 
+        s_w: i32, s_h: i32, s_x: i32, s_y: i32, // Starting geometry
+        t_w: i32, t_h: i32, t_x: i32, t_y: i32, // Target geometry
+        final_mode: WindowMode                  // What to become when done
+    },
+}
+
 pub struct SemanticWindow {
-    pub x: i32, pub y: i32, pub w: i32, pub h: i32,
+    pub id: u32,
+    pub x: i32, pub y: i32, pub w: i32, pub h: i32, 
+    pub normal_x: i32, pub normal_y: i32, pub normal_w: i32, pub normal_h: i32, 
+    pub base_z: i32, pub target_z: i32, // --- NEW: 3D Depth Tracking ---
+    pub state: WindowState,
     pub text_buffer: String,
     pub input_buffer: String,
-    pub scroll_offset: usize,
-    pub splat_cloud: Vec<GaussianSplat>, // <-- THE ORGANIC BODY
+    pub splat_cloud: Vec<GaussianSplat>,
 }
 
 impl SemanticWindow {
-    pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
-        let mut win = SemanticWindow { 
-            x, y, w, h, 
-            text_buffer: String::from("Welcome to PolymorphOS. Type HELP for commands.\n"),
+    /// Spawn a brand new window from a specific (x,y) origin
+    pub fn spawn(id: u32, origin_x: i32, origin_y: i32, target_w: i32, target_h: i32) -> Self {
+    let target_x = origin_x - (target_w / 2);
+    let target_y = origin_y - (target_h / 2);
+    
+    let mut win = SemanticWindow { 
+        id, x: origin_x, y: origin_y, w: 40, h: 40, 
+        normal_x: target_x, normal_y: target_y, normal_w: target_w, normal_h: target_h,
+        base_z: 0, target_z: 0, // Initialize at the front of the glass!
+            state: WindowState::Transitioning { 
+                progress: 0, max: 15, 
+                s_w: 40, s_h: 40, s_x: origin_x, s_y: origin_y,
+                t_w: target_w, t_h: target_h, t_x: target_x, t_y: target_y,
+                final_mode: WindowMode::Instantiated
+            },
+            text_buffer: alloc::format!("Instance {} Instantiated.\n", id),
             input_buffer: String::new(),
-            scroll_offset: 0,
             splat_cloud: Vec::new(),
         };
         win.generate_cloud();
         win
     }
 
-    ///[MICT: PROCEDURAL MORPHOLOGY v7 (The Tight UI)]
-    pub fn generate_cloud(&mut self) {
-        self.splat_cloud.clear();
-        
-        let cx = self.x + (self.w / 2);
-        let cy = self.y + (self.h / 2);
+    pub fn update_physics(&mut self) -> bool {
+    let mut redrew = false;
 
-        // --- 1. THE DARK CORE (Tucked inside the borders) ---
-        let corner_scale = (self.w / 4).min(self.h / 4) - 10; 
-        // Pull the centers further inward so the radius doesn't bleed out!
-        let padding = corner_scale + 10; 
-
-        let core_r = 5; let core_g = 10; let core_b = 15; 
-        let core_opacity = 220; 
-        
-        self.splat_cloud.push(GaussianSplat { x: self.x + padding, y: self.y + padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
-        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - padding, y: self.y + padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
-        self.splat_cloud.push(GaussianSplat { x: self.x + padding, y: self.y + self.h - padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
-        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - padding, y: self.y + self.h - padding, z: 10, scale: corner_scale, r: core_r, g: core_g, b: core_b, opacity: core_opacity });
-
-        // Center Filler
-        self.splat_cloud.push(GaussianSplat { 
-            x: cx, y: cy, z: 10, 
-            scale: (self.w / 2).min(self.h / 2), 
-            r: core_r, g: core_g, b: core_b, 
-            opacity: core_opacity 
-        });
-
-        // --- 2. THE GLOWING BORDER (Zero Scalloping) ---
-        let node_spacing = 8; // Halved the spacing to pack the splats tightly together
-        let border_scale = 16; // Shrunk the radius so it forms a tight line
-        
-        let num_x_nodes = self.w / node_spacing;
-        for i in 0..=num_x_nodes {
-            let px = self.x + (i * node_spacing);
-            self.splat_cloud.push(GaussianSplat { x: px, y: self.y, z: 12, scale: border_scale, r: 0, g: 255, b: 200, opacity: 120 }); // Top
-            self.splat_cloud.push(GaussianSplat { x: px, y: self.y + self.h, z: 12, scale: border_scale, r: 0, g: 100, b: 255, opacity: 90 }); // Bottom
+        // --- THE Z-AXIS PARALLAX PHYSICS ---
+        if self.base_z != self.target_z {
+            let diff = self.target_z - self.base_z;
+            self.base_z += diff / 4; // Smooth slide into the background
+            if diff.abs() < 5 { self.base_z = self.target_z; }
+            self.generate_cloud();
+            redrew = true;
         }
+        if let WindowState::Transitioning { progress, max, s_w, s_h, s_x, s_y, t_w, t_h, t_x, t_y, final_mode } = self.state {
+            let p = progress + 1;
+            // Integer Ease-Out
+            let factor = (p * (2 * max - p) * 100) / (max * max);
+            
+            self.w = s_w + ((t_w - s_w) * factor) / 100;
+            self.h = s_h + ((t_h - s_h) * factor) / 100;
+            self.x = s_x + ((t_x - s_x) * factor) / 100;
+            self.y = s_y + ((t_y - s_y) * factor) / 100;
 
-        let num_y_nodes = self.h / node_spacing;
-        for i in 0..=num_y_nodes {
-            let py = self.y + (i * node_spacing);
-            self.splat_cloud.push(GaussianSplat { x: self.x, y: py, z: 12, scale: border_scale, r: 0, g: 150, b: 255, opacity: 90 }); // Left
-            self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: py, z: 12, scale: border_scale, r: 0, g: 150, b: 255, opacity: 90 }); // Right
-        }
-
-        // --- 3. THE CORNER ANCHORS ---
-        let anchor_scale = 30; // Shrunk to match the tighter borders
-        self.splat_cloud.push(GaussianSplat { x: self.x, y: self.y, z: 13, scale: anchor_scale, r: 0, g: 255, b: 255, opacity: 180 });
-        self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: self.y, z: 13, scale: anchor_scale, r: 0, g: 255, b: 255, opacity: 180 });
-        self.splat_cloud.push(GaussianSplat { x: self.x, y: self.y + self.h, z: 13, scale: anchor_scale, r: 50, g: 100, b: 255, opacity: 150 });
-        self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: self.y + self.h, z: 13, scale: anchor_scale, r: 50, g: 100, b: 255, opacity: 150 });
-
-        // --- 4. PROCEDURAL WINDOW CONTROLS ---
-        // Close Button (Red)
-        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 25, y: self.y + 5, z: 14, scale: 12, r: 255, g: 50, b: 50, opacity: 200 });
-        // Minimize Button (Yellow)
-        self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 55, y: self.y + 5, z: 14, scale: 12, r: 255, g: 200, b: 50, opacity: 200 });
+            if p >= max {
+                self.w = t_w; self.h = t_h; self.x = t_x; self.y = t_y;
+                self.state = WindowState::Stable(final_mode);
+            } else {
+                self.state = WindowState::Transitioning { progress: p, max, s_w, s_h, s_x, s_y, t_w, t_h, t_x, t_y, final_mode };
+            }
+            self.generate_cloud();
+            redrew = true; 
     }
+    
+    redrew
+}
+
+pub fn generate_cloud(&mut self) {
+    self.splat_cloud.clear();
+    let cx = self.x + (self.w / 2);
+    let cy = self.y + (self.h / 2);
+    let core_scale = (self.w / 4).min(self.h / 4).max(10);
+    
+    // Notice how we add self.base_z to the Z coordinates!
+    let padding = core_scale; 
+    self.splat_cloud.push(GaussianSplat { x: cx, y: cy, z: self.base_z + 10, scale_x: (self.w / 2).max(10), scale_y: (self.h / 2).max(10), r: 5, g: 10, b: 15, opacity: 220 });
+
+    let thickness = 4;
+    // Top border
+    self.splat_cloud.push(GaussianSplat { x: cx, y: self.y, z: self.base_z + 12, scale_x: self.w / 2, scale_y: thickness, r: 0, g: 255, b: 200, opacity: 120 }); 
+    // Bottom border
+    self.splat_cloud.push(GaussianSplat { x: cx, y: self.y + self.h, z: self.base_z + 12, scale_x: self.w / 2, scale_y: thickness, r: 0, g: 100, b: 255, opacity: 90 }); 
+    // Left border
+    self.splat_cloud.push(GaussianSplat { x: self.x, y: cy, z: self.base_z + 12, scale_x: thickness, scale_y: self.h / 2, r: 0, g: 150, b: 255, opacity: 90 }); 
+    // Right border
+    self.splat_cloud.push(GaussianSplat { x: self.x + self.w, y: cy, z: self.base_z + 12, scale_x: thickness, scale_y: self.h / 2, r: 0, g: 150, b: 255, opacity: 90 });
+
+    // Buttons
+    if let WindowState::Stable(mode) = self.state {
+        if mode != WindowMode::Dead {
+            self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 25, y: self.y + 15, z: self.base_z + 14, scale_x: 12, scale_y: 12, r: 255, g: 50, b: 50, opacity: 200 });
+            self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 55, y: self.y + 15, z: self.base_z + 14, scale_x: 12, scale_y: 12, r: 255, g: 200, b: 50, opacity: 200 });
+            self.splat_cloud.push(GaussianSplat { x: self.x + self.w - 85, y: self.y + 15, z: self.base_z + 14, scale_x: 12, scale_y: 12, r: 50, g: 255, b: 100, opacity: 200 });
+        }
+    }
+}
+
+    // Action Triggers
+    pub fn trigger_close(&mut self, launcher_x: i32, launcher_y: i32) {
+        self.state = WindowState::Transitioning { 
+            progress: 0, max: 15, 
+            s_w: self.w, s_h: self.h, s_x: self.x, s_y: self.y,
+            t_w: 40, t_h: 40, t_x: launcher_x, t_y: launcher_y, // Shrink back to launcher
+            final_mode: WindowMode::Dead 
+        };
+    }
+
+    pub fn trigger_maximize(&mut self, screen_w: i32, screen_h: i32) {
+        // Save current geometry so we can restore later!
+        if self.state == WindowState::Stable(WindowMode::Instantiated) {
+            self.normal_x = self.x; self.normal_y = self.y; 
+            self.normal_w = self.w; self.normal_h = self.h;
+        }
+        self.state = WindowState::Transitioning { 
+            progress: 0, max: 15, 
+            s_w: self.w, s_h: self.h, s_x: self.x, s_y: self.y,
+            t_w: screen_w, t_h: screen_h, t_x: 0, t_y: 0,
+            final_mode: WindowMode::Maximized 
+        };
+    }
+
+    pub fn trigger_restore(&mut self) {
+        self.state = WindowState::Transitioning { 
+            progress: 0, max: 15, 
+            s_w: self.w, s_h: self.h, s_x: self.x, s_y: self.y,
+            t_w: self.normal_w, t_h: self.normal_h, t_x: self.normal_x, t_y: self.normal_y,
+            final_mode: WindowMode::Instantiated 
+        };
+    }
+
 
     pub fn move_to(&mut self, new_x: i32, new_y: i32) {
         self.x = new_x;
         self.y = new_y;
-        self.generate_cloud(); // Morph to the new location!
+        self.generate_cloud();
     }
 
-    //[MICT: THE NEW ORGANIC RENDERER]
-    pub fn render_body(&self, gpu: &mut crate::gpu_driver::GpuDriver) {
-        // We draw the cloud instead of a rigid glass rectangle!
+    pub fn render_body(&self, gpu: &mut GpuDriver) {
         for splat in &self.splat_cloud {
             render_single_splat(gpu, splat);
         }
     }
+
 
 // [MICT: THE COMMAND EXECUTOR]
 pub fn execute_command(&mut self) {
@@ -196,15 +286,37 @@ pub fn execute_command(&mut self) {
         }
         "PING" => {
             if arg1 == "NVME" {
-                let out = "[MICT: CHECK] NVMe Controller is ONLINE.\n";
+                // ... NVMe code ...
+            } else if arg1 == "ROUTER" {
+                let out = "[MICT] Forging ICMP Echo Request...\n";
                 self.text_buffer.push_str(out);
                 crate::serial_println!("{}", out);
+                
+                if let Some(nic) = crate::e1000::E1000_NET.lock().as_mut() {
+                    unsafe {
+                        // Target the Default QEMU Router MAC Address!
+                        nic.send_ping([0x52, 0x54, 0x00, 0x12, 0x34, 0x56],[10, 0, 2, 2], [10, 0, 2, 15]);
+                    }
+                }
             } else {
-                let usage = "Usage: PING NVME\n";
+                let usage = "Usage: PING[NVME | ROUTER]\n";
                 self.text_buffer.push_str(usage);
                 crate::serial_println!("{}", usage);
             }
         }
+        // Put this right below your PING match arm
+        "ARP" => {
+            let out = "[MICT] Broadcasting ARP Request to Virtual Router...\n";
+            self.text_buffer.push_str(out);
+            crate::serial_println!("{}", out);
+            
+            if let Some(nic) = crate::e1000::E1000_NET.lock().as_mut() {
+                unsafe {
+                    // Ask "Who has 10.0.2.2?" from "10.0.2.15"
+                    nic.send_arp_request([10, 0, 2, 2], [10, 0, 2, 15]);
+                }
+            }
+        }        
         "SAVE" => {
             if arg1 != "" {
                 let out = alloc::format!("Saving file: '{}'\n", arg1);
@@ -229,31 +341,43 @@ pub fn execute_command(&mut self) {
                 crate::serial_println!("{}", usage);
             }
         }
-        "READ" => {
-            if arg1 != "" {
-                let out = alloc::format!("Reading file: '{}'\n", arg1);
-                self.text_buffer.push_str(&out);
-                crate::serial_println!("{}", out);
-                match crate::mfs::MictFileSystem::read_file(arg1) {
-                    Ok(data) => {
-                        let valid_len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                        let text = core::str::from_utf8(&data[0..valid_len]).unwrap_or("[CORRUPT]");
-                        let content_out = alloc::format!("  -> CONTENTS: {}\n", text);
-                        self.text_buffer.push_str(&content_out);
-                        crate::serial_println!("{}", content_out);
-                    }
-                    Err(e) => {
-                        let err_out = alloc::format!("  [FAIL] {}\n", e);
-                        self.text_buffer.push_str(&err_out);
-                        crate::serial_println!("{}", err_out);
-                    }
+         "READ" => {
+        if arg1 != "" {
+            let out = alloc::format!("Reading file: '{}'\n", arg1);
+            self.text_buffer.push_str(&out);
+            crate::serial_println!("{}", out);
+            
+            // [MICT: THE IDENTITY BADGE]
+            // Construct the execution context for the Virtual Machine.
+            // We use 0xAA to simulate the authorized "System_Root" matching the file owner.
+            let terminal_context = crate::mdo_vm::MdoContext {
+                requestor_id_hash: [0xAA; 32], // I am the authorized owner!
+                action_hash: [0x00; 32], 
+                owner_id_hash: [0x00; 32], 
+                status: 0,
+            };
+
+            // Pass the context badge to the MFS gate!
+            match crate::mfs::MictFileSystem::read_file(arg1, &terminal_context) {
+                Ok(data) => {
+                    let valid_len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                    let text = core::str::from_utf8(&data[0..valid_len]).unwrap_or("[CORRUPT]");
+                    let content_out = alloc::format!("  -> CONTENTS: {}\n", text);
+                    self.text_buffer.push_str(&content_out);
+                    crate::serial_println!("{}", content_out);
                 }
-            } else {
-                let usage = "Usage: READ <FILENAME>\n";
-                self.text_buffer.push_str(usage);
-                crate::serial_println!("{}", usage);
+                Err(e) => {
+                    let err_out = alloc::format!("  [FAIL] {}\n", e);
+                    self.text_buffer.push_str(&err_out);
+                    crate::serial_println!("{}", err_out);
+                }
             }
+        } else {
+            let usage = "Usage: READ <FILENAME>\n";
+            self.text_buffer.push_str(usage);
+            crate::serial_println!("{}", usage);
         }
+    }
         "LIST" => {
             let out = "Listing files in root directory:\n";
             self.text_buffer.push_str(out);
@@ -329,6 +453,10 @@ pub fn execute_command(&mut self) {
 
 //[MICT: THE NEW TEXT RENDERER - ZERO ALLOCATION PHYSICAL WRAP]
     pub fn render_text(&self, gpu: &mut crate::gpu_driver::GpuDriver) {
+        match self.state {
+        WindowState::Stable(WindowMode::Instantiated) | WindowState::Stable(WindowMode::Maximized) => {},
+        _ => return, // Hide text during expanding/shrinking!
+    } 
         use font8x8::legacy::BASIC_LEGACY;
         
         // [FIXED] Subtract 60 (30px left padding + 30px right padding) to stop the overrun!
@@ -412,44 +540,196 @@ pub fn execute_command(&mut self) {
     }
 }
 
+
+pub struct AppLauncher {
+    pub x: i32, pub y: i32, pub radius: i32,
+}
+
 pub struct SplatEngine {
     pub nebula_splats: Vec<GaussianSplat>,
-    pub active_window: Option<SemanticWindow>,
+    pub launchers: Vec<AppLauncher>,
+    pub windows: Vec<SemanticWindow>,
+    pub instance_counter: u32,
 }
 
 impl SplatEngine {
     pub fn new() -> Self {
-        SplatEngine { nebula_splats: Vec::new(), active_window: None }
-    }
-
-    pub fn add_splat(&mut self, splat: GaussianSplat) {
-        self.nebula_splats.push(splat);
-    }
-
-        pub fn render(&mut self, gpu: &mut crate::gpu_driver::GpuDriver) {
-        // 1. Render Background Nebula
-        self.nebula_splats.sort_by(|a, b| a.z.cmp(&b.z));
-        for splat in &self.nebula_splats {
-            render_single_splat(gpu, splat); // <-- Much cleaner now!
+        SplatEngine { 
+            nebula_splats: Vec::new(), 
+            launchers: Vec::new(),
+            windows: Vec::new(),
+            instance_counter: 1,
         }
+    }
 
-        // 2. Render Active Window Cloud & Text
-        if let Some(win) = &mut self.active_window {
+    pub fn tick_physics(&mut self) -> bool {
+        let mut redrew = false;
+        for win in &mut self.windows {
+            if win.update_physics() { redrew = true; }
+        }
+        // Garbage collection! Remove windows that have finished shrinking to the Dead state.
+        self.windows.retain(|w| w.state != WindowState::Stable(WindowMode::Dead));
+        redrew
+    }
+    
+    // ... (Keep existing render function, just loop over self.windows instead of active_window)
+    pub fn render(&mut self, gpu: &mut GpuDriver) {
+        self.nebula_splats.sort_by(|a, b| a.z.cmp(&b.z));
+        for splat in &self.nebula_splats { render_single_splat(gpu, splat); }
+
+        // Render Launchers
+    for l in &self.launchers {
+        render_single_splat(gpu, &GaussianSplat { 
+            x: l.x, y: l.y, z: 10, 
+            scale_x: l.radius, scale_y: l.radius, // <--- THE FIX
+            r: 0, g: 255, b: 200, opacity: 200 
+        });
+        render_single_splat(gpu, &GaussianSplat { 
+            x: l.x, y: l.y, z: 11, 
+            scale_x: l.radius/2, scale_y: l.radius/2, // <--- THE FIX
+            r: 255, g: 255, b: 255, opacity: 255 
+        });
+    }
+        for win in &mut self.windows {
             win.render_body(gpu);
-            win.render_text(gpu); 
+            if let WindowState::Stable(_) = win.state { win.render_text(gpu); }
         }
     }
 }
 
+//[MICT: THE UNIVERSAL COMPOSITOR]
+pub fn render_desktop(gpu: &mut GpuDriver, engine: &mut SplatEngine) {
+    let cx = CURSOR_X.load(Ordering::SeqCst);
+    let cy = CURSOR_Y.load(Ordering::SeqCst);
+    let clicked = LEFT_CLICK.load(Ordering::SeqCst);
+    let (cr, cg, cb) = if clicked { (255, 50, 50) } else { (255, 255, 255) };
 
-//[MICT: THE SYSTEM LOGGER (Restored!)]
+    let sw = SCREEN_WIDTH.load(Ordering::SeqCst);
+    let sh = SCREEN_HEIGHT.load(Ordering::SeqCst);
+    
+    // [FIXED] Declare our tracking variables
+    let mut click_handled = false;
+    let mut clicked_win_idx = None;
+
+    if clicked {
+        // 1. Find which window we clicked (iterate backwards to click top-most)
+        for (i, win) in engine.windows.iter_mut().enumerate().rev() {
+            if let WindowState::Stable(_) = win.state {
+                let close_x = win.x + win.w - 25;
+                let rest_x = win.x + win.w - 55;
+                let max_x = win.x + win.w - 85;
+                let btn_y = win.y + 15;
+
+                // Close Button
+                if (cx - close_x).abs() < 15 && (cy - btn_y).abs() < 15 {
+                    win.trigger_close(engine.launchers[0].x, engine.launchers[0].y);
+                    click_handled = true; 
+                    clicked_win_idx = Some(i);
+                    break;
+                }
+                // Restore Button
+                else if (cx - rest_x).abs() < 15 && (cy - btn_y).abs() < 15 {
+                    win.trigger_restore(); 
+                    click_handled = true; 
+                    clicked_win_idx = Some(i);
+                    break;
+                }
+                // Maximize Button
+                else if (cx - max_x).abs() < 15 && (cy - btn_y).abs() < 15 {
+                    win.trigger_maximize(sw, sh); 
+                    click_handled = true; 
+                    clicked_win_idx = Some(i);
+                    break;
+                }
+                // Window Dragging
+                else if cx >= win.x && cx <= win.x + win.w && cy >= win.y && cy <= win.y + 40 {
+                    IS_DRAGGING.store(true, Ordering::SeqCst);
+                    DRAG_OFFSET_X.store(cx - win.x, Ordering::SeqCst);
+                    DRAG_OFFSET_Y.store(cy - win.y, Ordering::SeqCst);
+                    click_handled = true; 
+                    clicked_win_idx = Some(i);
+                    break;
+                }
+            }
+            
+            // [NEW] If they just clicked the body of the window to focus it:
+            if cx >= win.x && cx <= win.x + win.w && cy >= win.y && cy <= win.y + win.h {
+                clicked_win_idx = Some(i);
+                click_handled = true;
+                break;
+            }
+        }
+
+        // 2. Window Focus: Pop the clicked window out, push it to the end!
+        if let Some(idx) = clicked_win_idx {
+            let focused_win = engine.windows.remove(idx);
+            engine.windows.push(focused_win);
+        } 
+        // 3. Check Launchers if no window was clicked
+        else if !click_handled && !IS_DRAGGING.load(Ordering::SeqCst) {
+            for l in &engine.launchers {
+                if (cx - l.x).abs() < l.radius && (cy - l.y).abs() < l.radius {
+                    let new_win = SemanticWindow::spawn(engine.instance_counter, l.x, l.y, 800, 600);
+                    engine.windows.push(new_win);
+                    engine.instance_counter += 1;
+                    break;
+                }
+            }
+        }
+    } else {
+        IS_DRAGGING.store(false, Ordering::SeqCst);
+    }
+
+    // --- [NEW] THE 3D PARALLAX MAGIC ---
+    // Top window comes to Z=0. Background windows sink to Z=300.
+    let win_count = engine.windows.len();
+    for (i, win) in engine.windows.iter_mut().enumerate() {
+        if i == win_count.saturating_sub(1) {
+            win.target_z = 0;   // Come to the front!
+        } else {
+            win.target_z = 300; // Sink into the background!
+        }
+    }
+
+    // Apply drag to the *last* window in the vector (the top one)
+    if IS_DRAGGING.load(Ordering::SeqCst) {
+        if let Some(win) = engine.windows.last_mut() {
+            let off_x = DRAG_OFFSET_X.load(Ordering::SeqCst);
+            let off_y = DRAG_OFFSET_Y.load(Ordering::SeqCst);
+            win.x = cx - off_x; 
+            win.y = cy - off_y;
+            win.generate_cloud();
+        }
+    }
+// --- [FIXED] THE MISSING RENDER COMMANDS! ---
+    
+    // 1. Advance the math (handles expansion/shrinking/Z-depth)
+    engine.tick_physics(); 
+
+    // 2. Draw the background cache
+    gpu.restore_from_nebula_cache(); 
+    
+    // 3. Draw the launchers and windows
+    engine.render(gpu);
+    
+    // 4. Draw the Cursor
+    for dy in 0..5 {
+        for dx in 0..5 { 
+            gpu.draw_pixel((cx + dx) as i32, (cy + dy) as i32, cr, cg, cb); 
+        }
+    }
+    
+    // 5. PUSH TO HARDWARE!
+    gpu.swap_buffers();
+} 
+
+//[MICT: THE SYSTEM LOGGER]
 impl fmt::Write for SplatEngine {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if let Some(win) = &mut self.active_window {
-            // System logs go straight to history! No command execution.
+        // [FIXED] Send system logs to the top-most (focused) window!
+        if let Some(win) = self.windows.last_mut() {
             win.text_buffer.push_str(s);
             
-            // Memory safety: Prevent infinite string growth
             if win.text_buffer.len() > 2000 {
                 win.text_buffer.drain(0..500); 
             }
@@ -458,57 +738,6 @@ impl fmt::Write for SplatEngine {
     }
 }
 
-//[MICT: THE UNIVERSAL COMPOSITOR]
-pub fn render_desktop(gpu: &mut crate::gpu_driver::GpuDriver, engine: &mut SplatEngine) {
-    let cx = CURSOR_X.load(Ordering::SeqCst);
-    let cy = CURSOR_Y.load(Ordering::SeqCst);
-    let clicked = LEFT_CLICK.load(Ordering::SeqCst);
-    let (cr, cg, cb) = if clicked { (255, 50, 50) } else { (255, 255, 255) };
-
-    // ---[MICT: DRAG AND DROP PHYSICS] ---
-    if let Some(win) = &mut engine.active_window {
-        let is_dragging = IS_DRAGGING.load(Ordering::SeqCst);
-
-        if clicked {
-            // Check if we just clicked the top "Title Bar" area of the window
-            if !is_dragging && cx >= win.x && cx <= win.x + win.w && cy >= win.y && cy <= win.y + 40 {
-                // Lock the drag state and record where on the window we clicked
-                IS_DRAGGING.store(true, Ordering::SeqCst);
-                DRAG_OFFSET_X.store(cx - win.x, Ordering::SeqCst);
-                DRAG_OFFSET_Y.store(cy - win.y, Ordering::SeqCst);
-            } 
-            
-            // If we are currently dragging, move the window!
-            if IS_DRAGGING.load(Ordering::SeqCst) {
-                let off_x = DRAG_OFFSET_X.load(Ordering::SeqCst);
-                let off_y = DRAG_OFFSET_Y.load(Ordering::SeqCst);
-                
-                // Call the procedural morph function!
-                win.move_to(cx - off_x, cy - off_y); 
-            }
-        } else {
-            // Mouse button released, drop the window
-            if is_dragging {
-                IS_DRAGGING.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-
-        gpu.restore_from_nebula_cache(); 
-    
-    if let Some(win) = &mut engine.active_window {
-        win.render_body(gpu);
-        win.render_text(gpu);
-    }
-    
-    for dy in 0..5 {
-        for dx in 0..5 {
-            gpu.draw_pixel((cx + dx) as i32, (cy + dy) as i32, cr, cg, cb);
-        }
-    }
-    
-    gpu.swap_buffers();
-}
 
 #[macro_export]
 macro_rules! screen_print {

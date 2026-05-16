@@ -21,6 +21,9 @@ pub mod nvme;
 pub mod splat;
 pub mod mfs;
 pub mod e1000;
+pub mod mdo_vm;
+
+
 pub mod virtio_gpu;
 pub mod virtio_pci;
 pub mod virtqueue;

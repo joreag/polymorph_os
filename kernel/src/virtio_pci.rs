@@ -172,25 +172,26 @@ pub fn init_virtio_device(
         }
 
         // 2. Tame Godzilla & Center the Nebula
-        if let Some(engine) = crate::splat::SPLAT_ENGINE.lock().as_mut() {
-            if let Some(win) = &mut engine.active_window {
-                win.w = ((screen_w as f32) * 0.4) as i32;
-                win.h = ((screen_h as f32) * 0.4) as i32;
-                let center_x = ((screen_w as i32) - win.w) / 2;
-                let center_y = ((screen_h as i32) - win.h) / 2;
-                win.move_to(center_x, center_y); 
-            }
-            
-            let true_cx = (screen_w / 2) as i32;
-            let true_cy = (screen_h / 2) as i32;
-            
-            if engine.nebula_splats.len() >= 2 {
-                engine.nebula_splats[0].x = true_cx - 200;
-                engine.nebula_splats[0].y = true_cy - 100;
-                engine.nebula_splats[1].x = true_cx + 200;
-                engine.nebula_splats[1].y = true_cy + 100;
-            }
+         if let Some(engine) = crate::splat::SPLAT_ENGINE.lock().as_mut() {
+        // [FIXED] Target the top-most window, if one exists!
+        if let Some(win) = engine.windows.last_mut() {
+            win.w = ((screen_w as f32) * 0.4) as i32;
+            win.h = ((screen_h as f32) * 0.4) as i32;
+            let center_x = ((screen_w as i32) - win.w) / 2;
+            let center_y = ((screen_h as i32) - win.h) / 2;
+            win.move_to(center_x, center_y); 
         }
+        
+        let true_cx = (screen_w / 2) as i32;
+        let true_cy = (screen_h / 2) as i32;
+        
+        if engine.nebula_splats.len() >= 2 {
+            engine.nebula_splats[0].x = true_cx - 200;
+            engine.nebula_splats[0].y = true_cy - 100;
+            engine.nebula_splats[1].x = true_cx + 200;
+            engine.nebula_splats[1].y = true_cy + 100;
+        }
+    }
 
         // 3. Create the Hardware Canvas
         if let Err(e) = gpu_driver.create_2d_canvas(1, screen_w, screen_h) {
